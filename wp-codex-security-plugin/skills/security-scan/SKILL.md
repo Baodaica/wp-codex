@@ -68,7 +68,7 @@ Run:
 
 Then run:
 
-<python_command> <plugin_dir>/scripts/wordpress/wp_candidate_map.py <TARGET>
+<python_command> <plugin_dir>/scripts/wordpress/wp_candidate_map_v5.py <TARGET>
 
 The candidate mapper produces:
 
@@ -439,3 +439,210 @@ Before finishing, verify:
   low.
 
 Do not equate PHP-file enumeration with WordPress security coverage.
+
+
+## WordPress Security Graph V5 Orchestration
+
+When the target is a WordPress plugin and the V5 artifacts exist:
+
+`wpsec-output/<PLUGIN>/v5/summary.json`
+
+`wpsec-output/<PLUGIN>/v5/review-index.json`
+
+`wpsec-output/<PLUGIN>/v5/gap-index.json`
+
+the V5 workflow takes precedence over the V4 candidate-first workflow.
+
+### Initial context
+
+Initially read only:
+
+1. `v5/summary.json`
+2. `v5/review-index.json`
+3. `v5/gap-index.json`
+
+Do NOT initially load:
+
+- `v5/security-graph.json`
+- `v2/candidates.json`
+- `v2/review-units.json`
+- `v2/review-index.json`
+- `callbacks.json`
+- `surface-map.json`
+
+The full V5 security graph and V4 artifacts are drill-down or fallback
+evidence only.
+
+### V5 security coverage
+
+The deterministic V5 frontend inventories WordPress registrations,
+request-relevant callbacks, bounded call paths, request sources,
+security controls, security effects, flow confidence, and unresolved
+security-relevant gaps.
+
+Security coverage is based on disposition of:
+
+- every V5 review unit; and
+- every V5 model-facing gap unit.
+
+Do not equate security coverage with reading every PHP file.
+
+Do not launch a generic repository-wide baseline audit merely to achieve
+file coverage.
+
+### Review effort
+
+`review_effort` is model-work prioritization only. It is NOT severity
+and MUST NOT be used to suppress a unit.
+
+For `deep` units:
+
+- perform complete semantic validation;
+- verify attacker reachability;
+- verify source-to-effect flow;
+- inspect applicable authorization and sink-specific controls;
+- actively seek counter-evidence;
+- derive concrete impact;
+- consider viable attack chaining.
+
+For `normal` units:
+
+- perform standard semantic validation;
+- inspect the provided source anchors first;
+- deepen the review only when a plausible security invariant violation
+  remains.
+
+For `bounded` or flow-`unknown` units:
+
+- perform a bounded semantic check of the registration, callback,
+  relevant locations, and necessary helper edges;
+- never interpret `unknown` as safe;
+- escalate the unit to normal or deep review if a plausible attack path
+  appears.
+
+### Per-unit source boundary
+
+Start from the source locations listed in `review-index.json`.
+
+Inspect only the registration, callback, relevant locations, and helper
+definitions necessary to validate the specific unit.
+
+Follow concrete call, dataflow, inheritance, ownership, authorization,
+or framework-semantic edges when necessary.
+
+Do not perform repository-wide grep/find discovery for a review unit
+when deterministic V5 source anchors already identify its security
+surface.
+
+### Gap units
+
+Each item in `gap-index.json` is a bounded unresolved security-analysis
+task.
+
+Resolve only the stated gap and the minimal local dependencies required
+for that resolution.
+
+Examples include:
+
+- dynamic hook resolution;
+- dynamic callback resolution;
+- dynamic dispatch;
+- unresolved dataflow;
+- inheritance ambiguity;
+- framework semantic ambiguity.
+
+A gap resolver may follow bounded backward or forward source edges, but
+MUST NOT restart a full repository audit.
+
+If the gap becomes resolvable:
+
+- convert it conceptually into a normal review path;
+- validate its security semantics.
+
+If the gap cannot be resolved statically:
+
+- record it as deferred or unresolved with the exact proof gap;
+- do not silently treat it as safe.
+
+### Security graph drill-down
+
+`v5/security-graph.json` is a local drill-down artifact.
+
+Do not load it wholesale.
+
+When additional deterministic evidence is needed for one review unit,
+retrieve only the matching unit/path information or inspect the exact
+source anchors directly.
+
+### V4 fallback
+
+V4 artifacts may be consulted only when:
+
+1. V5 artifacts are absent; or
+2. a concrete V5 review/gap unit exposes a coverage discrepancy that
+   requires comparison with the legacy mapper.
+
+Do not run the V4 queue in parallel with a complete V5 queue merely for
+completeness.
+
+### Novel vulnerability reasoning
+
+V5 taxonomy is a discovery aid, not an exhaustive vulnerability list.
+
+For each security-relevant V5 path, reason about the violated security
+invariant rather than requiring the path to match a predefined
+vulnerability family.
+
+Consider, where source evidence supports it:
+
+- authentication bypass;
+- authorization bypass;
+- object-level authorization failure;
+- privilege escalation;
+- sensitive information disclosure;
+- unsafe state transition;
+- injection;
+- arbitrary filesystem effects;
+- unsafe code execution;
+- cross-boundary request effects;
+- chained impact.
+
+Do NOT run an independent repository-wide novelty scan.
+
+Novel findings must originate from the supplied V5 security graph,
+review units, bounded gap resolution, or a concrete helper path reached
+from them.
+
+### Preserve Codex Security strengths
+
+V5 changes discovery and work scheduling only.
+
+Preserve the original Codex Security strengths during semantic review:
+
+- threat-boundary reasoning;
+- attacker capability analysis;
+- source-backed attack-path reasoning;
+- active counter-evidence search;
+- WordPress authorization semantics;
+- business-logic reasoning;
+- attack-chain reasoning;
+- independent validation for plausible reportable findings;
+- calibrated severity and confidence;
+- honest unresolved/deferred work;
+- canonical findings and reporting.
+
+Do not reduce semantic validation quality merely because deterministic
+discovery reduced the amount of source that requires model review.
+
+### Completion
+
+A V5 WordPress scan may be marked complete only when:
+
+- every review unit has a disposition;
+- every model-facing gap has a resolution or explicit unresolved/deferred
+  disposition;
+- every reportable finding has source-backed attacker-to-impact
+  reachability;
+- applicable counter-evidence was checked;
+- no unit was silently discarded because of low priority or unknown flow.
+
