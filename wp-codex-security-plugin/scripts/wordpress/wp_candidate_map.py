@@ -969,8 +969,11 @@ def generate_candidates(entrypoints, function_index):
                             True,
                     },
 
-                    "code_slice":
-                        definition["body"][:15000],
+                    "callback_ref": (
+                        f'{definition["file"]}:'
+                        f'{definition["line"]}:'
+                        f'{definition["name"]}'
+                    ),
                 })
 
                 candidate_id += 1
@@ -1075,9 +1078,46 @@ def main():
         entrypoints
     )
 
+    callbacks = {}
+
+    for items in function_index.values():
+        for definition in items:
+            ref = (
+                f'{definition["file"]}:'
+                f'{definition["line"]}:'
+                f'{definition["name"]}'
+            )
+
+            if ref not in callbacks:
+                callbacks[ref] = {
+                    "ref": ref,
+                    "name": definition["name"],
+                    "class": definition["class"],
+                    "file": definition["file"],
+                    "line": definition["line"],
+                    "code": definition["body"][:15000],
+                }
+
+    used_callback_refs = {
+        x["callback_ref"]
+        for x in candidates
+        if x.get("callback_ref")
+    }
+
+    callbacks = {
+        ref: item
+        for ref, item in callbacks.items()
+        if ref in used_callback_refs
+    }
+
     write_json(
         output_dir / "candidates.json",
         candidates
+    )
+
+    write_json(
+        output_dir / "callbacks.json",
+        callbacks
     )
 
     write_json(
