@@ -18,3 +18,18 @@ dist/
 wpsec-output/
 wp-codex-security-plugin/scripts/wordpress/__pycache__/
 *.pyc
+
+# WordPress Security development backups
+wp-codex-security-plugin/scripts/wordpress/*.v*-backup
+wp-codex-security-plugin/scripts/wordpress/*.pre-*
+wp-codex-security-plugin/scripts/wordpress/*-backup
+wp-codex-security-plugin/skills/security-scan/*.backup
+wp-codex-security-plugin/skills/security-scan/*.v*-backup
+
+# Local scan artifacts
+wpsec-output/
+*.pyc
+__pycache__/
+
+# Additional local mapper snapshots
+wp-codex-security-plugin/scripts/wordpress/*.v*-*
