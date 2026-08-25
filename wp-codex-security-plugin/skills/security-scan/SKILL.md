@@ -340,3 +340,102 @@ For each reportable finding provide:
 
 Never label runtime exploitability as dynamically confirmed unless
 a separate authorized dynamic test actually occurred.
+
+
+## WordPress Candidate-First Orchestration Override
+
+When the authorized target is a WordPress plugin and
+`wpsec-output/<PLUGIN>/v2/review-index.json` exists, this workflow
+takes precedence over generic repository-wide discovery behavior.
+
+### Coverage semantics
+
+Complete WordPress security coverage means reviewing all review units
+produced by the deterministic WordPress mapper plus unresolved
+entrypoints that require manual resolution.
+
+It does NOT require reading every PHP file in the plugin.
+
+Files with no mapped entrypoint, reachable helper path, sensitive sink,
+security control, or unresolved registration do not require semantic
+model review merely to satisfy repository file coverage.
+
+### Primary queue
+
+Use:
+
+`wpsec-output/<PLUGIN>/v2/review-index.json`
+
+as the complete initial semantic review queue.
+
+Review every unit in the index unless the user explicitly requests
+partial coverage.
+
+Do NOT initially load:
+
+- candidates.json
+- review-units.json
+- callbacks.json
+- surface-map.json
+
+These are drill-down artifacts only.
+
+### Per-unit source boundary
+
+For each review unit, initially inspect only:
+
+1. the entrypoint registration;
+2. the resolved callback;
+3. the listed sink locations;
+4. listed security-control locations;
+5. helper functions on the mapped call path required to determine
+   attacker-to-sink reachability.
+
+Expand beyond those locations only when a concrete unresolved dataflow,
+dispatch target, authorization check, sanitization step, dynamic
+callback, inheritance relationship, or security-sensitive helper
+requires it.
+
+Do not perform repository-wide grep/find discovery for a review unit
+when the mapper has already supplied the relevant source anchors.
+
+### Subagents
+
+Do not launch a generic repository-wide baseline auditor for WordPress
+candidate-first scans.
+
+If subagents are available, assign them bounded groups of review units.
+
+Each WordPress investigator MUST treat its assigned review units as the
+primary investigation boundary.
+
+It may follow concrete source-backed helper edges outside those units
+when necessary to validate the assigned attack path, but MUST NOT
+perform an independent full-repository audit or attempt to satisfy
+per-file repository coverage.
+
+Do not duplicate the same review unit across workers unless parent
+validation of a potential reportable finding specifically requires an
+independent second review.
+
+### Full-artifact escalation
+
+Load an individual matching object from review-units.json or
+candidates.json only when review-index.json lacks evidence required to
+resolve a specific unit.
+
+Never load either full artifact merely for discovery or completeness.
+
+### WordPress completeness
+
+Before finishing, verify:
+
+- every review-index unit has a disposition;
+- every unresolved entrypoint has been resolved, excluded with evidence,
+  or explicitly reported unresolved;
+- every reportable finding has source-backed attacker-to-impact
+  reachability;
+- no unit was silently dropped because its initial heuristic score was
+  low.
+
+Do not equate PHP-file enumeration with WordPress security coverage.
