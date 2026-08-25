@@ -13,3 +13,8 @@ dist/
 
 # Never publish internal-only plugin data.
 .internal/
+
+# WordPress Codex Security local artifacts
+wpsec-output/
+wp-codex-security-plugin/scripts/wordpress/__pycache__/
+*.pyc
