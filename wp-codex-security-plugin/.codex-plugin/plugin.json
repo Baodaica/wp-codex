@@ -1,5 +1,5 @@
 {
-  "name": "wordpress-codex-security",
+  "name": "codex-security",
   "version": "0.1.37",
   "description": "Experimental WordPress-focused security graph workflow built on Codex Security.",
   "author": {
