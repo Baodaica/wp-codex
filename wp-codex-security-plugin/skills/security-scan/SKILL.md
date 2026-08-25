@@ -64,11 +64,11 @@ run the local WordPress mappers against the scan target.
 
 Run:
 
-python3 /opt/codex-security/wp-codex-security-plugin/scripts/wordpress/wp_surface_map.py <TARGET>
+<python_command> <plugin_dir>/scripts/wordpress/wp_surface_map.py <TARGET>
 
 Then run:
 
-python3 /opt/codex-security/wp-codex-security-plugin/scripts/wordpress/wp_candidate_map.py <TARGET>
+<python_command> <plugin_dir>/scripts/wordpress/wp_candidate_map.py <TARGET>
 
 The candidate mapper produces:
 
