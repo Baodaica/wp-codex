@@ -33,3 +33,4 @@ __pycache__/
 
 # Additional local mapper snapshots
 wp-codex-security-plugin/scripts/wordpress/*.v*-*
+wp-codex-security-plugin/.codex-plugin/*.upstream-backup

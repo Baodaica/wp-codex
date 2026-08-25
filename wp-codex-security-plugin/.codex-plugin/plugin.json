@@ -1,9 +1,9 @@
 {
-  "name": "codex-security",
+  "name": "wordpress-codex-security",
   "version": "0.1.37",
-  "description": "Codex Security workflows for security scans, analysis, and investigation.",
+  "description": "Experimental WordPress-focused security graph workflow built on Codex Security.",
   "author": {
-    "name": "OpenAI"
+    "name": "WP Security Dev"
   },
   "homepage": "https://developers.openai.com/codex/security",
   "repository": "https://github.com/openai/codex-security",
@@ -19,12 +19,16 @@
   "apps": "./.app.json",
   "mcpServers": "./.mcp.json",
   "interface": {
-    "displayName": "Codex Security",
-    "shortDescription": "Security scanning for your codebase",
-    "longDescription": "Codex Security packages reusable workflows for security scans, analysis, validation, and investigation across code, diffs, and related artifacts.",
-    "developerName": "OpenAI",
+    "displayName": "WordPress Codex Security",
+    "shortDescription": "Candidate-first WordPress security scanning",
+    "longDescription": "Experimental WordPress-focused extension of Codex Security using deterministic security-surface mapping, bounded call/dataflow analysis, compact review queues, and Codex semantic validation.",
+    "developerName": "WP Security Dev",
     "category": "Security",
-    "capabilities": ["Interactive", "Read", "Write"],
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
     "websiteURL": "https://openai.com/",
     "privacyPolicyURL": "https://openai.com/policies/row-privacy-policy/",
     "termsOfServiceURL": "https://openai.com/policies/row-terms-of-use/",
