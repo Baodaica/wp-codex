@@ -74,7 +74,13 @@ The candidate mapper produces:
 
 /opt/codex-security/wpsec-output/<PLUGIN>/v2/summary.json
 
+/opt/codex-security/wpsec-output/<PLUGIN>/v2/review-index.json
+
+Full drill-down artifacts are also produced locally:
+
 /opt/codex-security/wpsec-output/<PLUGIN>/v2/candidates.json
+
+/opt/codex-security/wpsec-output/<PLUGIN>/v2/review-units.json
 
 /opt/codex-security/wpsec-output/<PLUGIN>/v2/unresolved-entrypoints.json
 
@@ -82,16 +88,29 @@ The candidate mapper produces:
 
 Read summary.json first.
 
-Then read candidates.json.
+Then read review-index.json.
+
+Do NOT load candidates.json, review-units.json, callbacks.json,
+surface-map.json, or other full graph artifacts into the initial
+model context.
+
+Those full artifacts are local drill-down data only.
 
 Do NOT begin by reading every PHP file in the target.
 
-The deterministic mapper has already inventoried generic
-WordPress entrypoints, security controls, sources, and dangerous sinks.
+The deterministic mapper has already inventoried WordPress
+entrypoints, reachable callbacks, sources, controls, dangerous
+sinks, and clustered review units.
 
-Use the candidate ledger as the primary discovery queue.
+Use review-index.json as the primary discovery queue.
 
-Review candidates in descending score order.
+Review units in descending priority/score order.
+
+For a selected review unit, open only the exact entrypoint,
+callback, sink locations, and helper functions required to
+validate that unit.
+
+Do not load the full candidate graph merely because it exists.
 
 Prioritize:
 
