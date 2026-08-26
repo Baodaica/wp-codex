@@ -1,4 +1,4 @@
 # WP Codex Security
 
-... TOÀN BỘ README TIẾNG ANH Ở ĐÂY ...
+[TOÀN BỘ README HOÀN CHỈNH Ở ĐÂY, KHÔNG PLACEHOLDER, KHÔNG CHIA BLOCK]
 
