@@ -646,3 +646,165 @@ A V5 WordPress scan may be marked complete only when:
 - applicable counter-evidence was checked;
 - no unit was silently discarded because of low priority or unknown flow.
 
+
+
+## WordPress Security State Graph V6
+
+When these artifacts exist:
+
+`wpsec-output/<PLUGIN>/v6/summary.json`
+
+`wpsec-output/<PLUGIN>/v6/review-index.json`
+
+the V6 state-transition queue supplements the V5 security graph.
+
+V6 does not replace V5.
+
+Use both:
+
+- V5 for request/dataflow/effect-oriented security paths;
+- V6 for authorization, identity, ownership, authentication,
+  privilege, configuration, token, and security-state transitions.
+
+### Initial V6 context
+
+Read:
+
+1. `v6/summary.json`
+2. `v6/review-index.json`
+
+Do NOT initially load the complete:
+
+`v6/security-state-graph.json`
+
+The full state graph is drill-down evidence only.
+
+### V6 review purpose
+
+V6 units identify security-sensitive state transitions that may not
+contain a traditional injection, file, SQL, or code-execution sink.
+
+For each V6 unit determine:
+
+- minimum attacker privilege;
+- whether the operation is remotely/request reachable;
+- whether the attacker controls the target user/object identity;
+- whether ownership is enforced;
+- whether a capability check protects the transition;
+- whether nonce/token checks are being mistaken for authorization;
+- what security meaning the changed state has;
+- which downstream code consumes the changed state;
+- whether the transition enables a second privileged workflow.
+
+### Privilege escalation reasoning
+
+For role, capability, user-state, or configuration transitions, explicitly
+consider chains such as:
+
+unauthenticated -> account creation -> privileged role
+
+subscriber -> user/config mutation -> administrator capability
+
+low-privilege user -> security option change -> privileged registration
+
+user-meta mutation -> approval/verification bypass -> privileged access
+
+configuration mutation -> newly reachable privileged surface
+
+Do not require a direct `set_role()` call in the original request handler
+if a changed configuration or state value causes privilege assignment
+downstream.
+
+### Account takeover reasoning
+
+For password, email, identity, token, or authentication transitions,
+explicitly verify:
+
+- victim selection;
+- ownership proof;
+- password-reset token generation and validation;
+- token binding to victim identity;
+- token replay;
+- token disclosure;
+- ability to change another user's password or email;
+- session/authentication establishment after the transition.
+
+Consider multi-request workflows.
+
+Do not restrict account-takeover analysis to a single callback when the
+security transition is completed across multiple requests.
+
+### Nonce semantics
+
+A valid WordPress nonce is a CSRF control and is not, by itself,
+authorization.
+
+Do not suppress a V6 unit merely because `wp_verify_nonce`,
+`check_ajax_referer`, or `check_admin_referer` is present.
+
+Capability, ownership, target-object authority, and workflow semantics must
+still be evaluated.
+
+### Configuration semantics
+
+For security-relevant configuration writes:
+
+1. identify the option/key being modified;
+2. determine whether the attacker controls the value;
+3. locate security-sensitive consumers of the option;
+4. determine whether the changed value modifies:
+   - registration;
+   - authentication;
+   - authorization;
+   - role assignment;
+   - capability assignment;
+   - verification;
+   - approval;
+   - privileged routing;
+   - access-control behavior.
+
+Follow concrete downstream consumers rather than declaring every
+`update_option()` call vulnerable.
+
+### Security-state completeness
+
+A WordPress scan must not be considered semantically complete solely because
+V5 sink/dataflow review is complete.
+
+When V6 artifacts exist:
+
+- every V6 review unit must receive a disposition;
+- unresolved ownership or authorization questions must remain explicit;
+- possible privilege/account-takeover chains must be followed to a concrete
+  security impact or rejected with source-backed counter-evidence.
+
+### Bounded investigation
+
+V6 is intended to avoid generic repository-wide rediscovery.
+
+Start from the V6 function/state-transition unit and inspect only:
+
+- its registration/exposure;
+- target identity/object derivation;
+- authorization controls;
+- state mutation;
+- direct downstream security consumers;
+- concrete helper paths required to validate the chain.
+
+Expand further only when a source-backed transition requires it.
+
+### Preserve semantic reasoning
+
+V6 state units are discovery hints, not vulnerability findings.
+
+Codex remains responsible for:
+
+- business-logic reasoning;
+- authorization semantics;
+- ownership semantics;
+- multi-step attack chains;
+- counter-evidence;
+- final exploitability;
+- severity;
+- confidence.
+

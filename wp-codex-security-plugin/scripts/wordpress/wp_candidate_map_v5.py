@@ -5977,6 +5977,508 @@ def build_security_graph_v5(
 
 
 # ============================================================
+
+# ================================================================
+# V6 SECURITY STATE GRAPH
+# ================================================================
+
+V6_IDENTITY_PATTERNS = {
+    "user_create": [
+        "wp_create_user",
+        "wp_insert_user",
+    ],
+    "user_update": [
+        "wp_update_user",
+    ],
+    "user_delete": [
+        "wp_delete_user",
+    ],
+    "role_transition": [
+        "set_role",
+        "add_role",
+        "remove_role",
+        "add_cap",
+        "remove_cap",
+    ],
+    "user_meta_transition": [
+        "update_user_meta",
+        "add_user_meta",
+        "delete_user_meta",
+    ],
+    "password_transition": [
+        "wp_set_password",
+        "reset_password",
+        "check_password_reset_key",
+        "get_password_reset_key",
+    ],
+    "authentication_transition": [
+        "wp_set_auth_cookie",
+        "wp_clear_auth_cookie",
+        "wp_signon",
+        "wp_authenticate",
+    ],
+}
+
+V6_CONFIGURATION_PATTERNS = {
+    "configuration_write": [
+        "update_option",
+        "add_option",
+        "delete_option",
+        "update_site_option",
+        "add_site_option",
+        "delete_site_option",
+    ],
+}
+
+V6_TOKEN_PATTERNS = {
+    "token_create_or_read": [
+        "wp_create_nonce",
+        "wp_nonce_url",
+        "wp_nonce_field",
+        "get_password_reset_key",
+    ],
+    "token_verify": [
+        "wp_verify_nonce",
+        "check_ajax_referer",
+        "check_admin_referer",
+        "check_password_reset_key",
+    ],
+}
+
+V6_AUTHORIZATION_PATTERNS = {
+    "capability_check": [
+        "current_user_can",
+        "user_can",
+        "map_meta_cap",
+    ],
+    "identity_check": [
+        "get_current_user_id",
+        "wp_get_current_user",
+        "is_user_logged_in",
+    ],
+}
+
+V6_OBJECT_PATTERNS = {
+    "user_lookup": [
+        "get_user_by",
+        "get_userdata",
+        "get_user_meta",
+    ],
+    "post_lookup": [
+        "get_post",
+        "get_post_meta",
+    ],
+}
+
+V6_SECURITY_META_HINTS = [
+    "role",
+    "capabil",
+    "permission",
+    "privilege",
+    "admin",
+    "password",
+    "passwd",
+    "email",
+    "verify",
+    "verified",
+    "approve",
+    "approved",
+    "activate",
+    "active",
+    "status",
+    "owner",
+    "ownership",
+    "auth",
+    "token",
+    "secret",
+    "registration",
+]
+
+
+def _v6_text(obj):
+    if obj is None:
+        return ""
+    return str(obj)
+
+
+def _v6_contains_any(text, patterns):
+    text = text.lower()
+
+    return any(
+        pattern.lower() in text
+        for pattern in patterns
+    )
+
+
+def _v6_scan_patterns(text, groups):
+    found = []
+
+    low = text.lower()
+
+    for category, patterns in groups.items():
+        matches = []
+
+        for pattern in patterns:
+            if pattern.lower() in low:
+                matches.append(pattern)
+
+        if matches:
+            found.append({
+                "category": category,
+                "matches": sorted(set(matches)),
+            })
+
+    return found
+
+
+def _v6_security_meta_hints(text):
+    low = text.lower()
+
+    return sorted({
+        hint
+        for hint in V6_SECURITY_META_HINTS
+        if hint in low
+    })
+
+
+def build_security_state_graph_v6(
+    plugin_root,
+    function_index,
+    registrations,
+    review_units,
+    model_gaps,
+):
+    """
+    Build model-facing security-state transition units.
+
+    V6 does not declare vulnerabilities. It identifies transitions where
+    authorization, ownership, identity, configuration, token lifecycle, or
+    cross-request state semantics require model reasoning.
+    """
+
+    units = []
+    seen = set()
+
+    if isinstance(function_index, dict):
+        function_items = function_index.items()
+    else:
+        function_items = []
+
+    registration_by_callback = {}
+
+    for reg in registrations or []:
+        cb = reg.get("callback") or {}
+        name = (
+            cb.get("function")
+            or cb.get("name")
+        )
+
+        if name:
+            registration_by_callback.setdefault(
+                name,
+                []
+            ).append(reg)
+
+    counter = 0
+
+    for function_name, function_obj in function_items:
+        text = _v6_text(function_obj)
+
+        identity = _v6_scan_patterns(
+            text,
+            V6_IDENTITY_PATTERNS,
+        )
+
+        config = _v6_scan_patterns(
+            text,
+            V6_CONFIGURATION_PATTERNS,
+        )
+
+        tokens = _v6_scan_patterns(
+            text,
+            V6_TOKEN_PATTERNS,
+        )
+
+        authorization = _v6_scan_patterns(
+            text,
+            V6_AUTHORIZATION_PATTERNS,
+        )
+
+        objects = _v6_scan_patterns(
+            text,
+            V6_OBJECT_PATTERNS,
+        )
+
+        security_hints = _v6_security_meta_hints(
+            text
+        )
+
+        transition_present = bool(
+            identity or config
+        )
+
+        if not transition_present:
+            continue
+
+        registrations_for_function = (
+            registration_by_callback.get(
+                function_name,
+                []
+            )
+        )
+
+        request_reachable = bool(
+            registrations_for_function
+        )
+
+        has_capability_check = any(
+            x["category"] == "capability_check"
+            for x in authorization
+        )
+
+        has_identity_check = any(
+            x["category"] == "identity_check"
+            for x in authorization
+        )
+
+        has_token_verification = any(
+            x["category"] == "token_verify"
+            for x in tokens
+        )
+
+        role_transition = any(
+            x["category"] == "role_transition"
+            for x in identity
+        )
+
+        password_transition = any(
+            x["category"] == "password_transition"
+            for x in identity
+        )
+
+        auth_transition = any(
+            x["category"] == "authentication_transition"
+            for x in identity
+        )
+
+        user_mutation = any(
+            x["category"] in {
+                "user_create",
+                "user_update",
+                "user_delete",
+                "user_meta_transition",
+            }
+            for x in identity
+        )
+
+        configuration_write = bool(config)
+
+        security_sensitive = bool(
+            role_transition
+            or password_transition
+            or auth_transition
+            or user_mutation
+            or (
+                configuration_write
+                and security_hints
+            )
+        )
+
+        if not security_sensitive:
+            continue
+
+        key = (
+            function_name,
+            tuple(
+                x["category"]
+                for x in identity
+            ),
+            tuple(
+                x["category"]
+                for x in config
+            ),
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        counter += 1
+
+        risk_reasons = []
+
+        if role_transition:
+            risk_reasons.append(
+                "role_or_capability_transition"
+            )
+
+        if password_transition:
+            risk_reasons.append(
+                "password_or_reset_transition"
+            )
+
+        if auth_transition:
+            risk_reasons.append(
+                "authentication_state_transition"
+            )
+
+        if user_mutation:
+            risk_reasons.append(
+                "user_security_state_mutation"
+            )
+
+        if configuration_write and security_hints:
+            risk_reasons.append(
+                "security_relevant_configuration_transition"
+            )
+
+        if request_reachable and not has_capability_check:
+            risk_reasons.append(
+                "request_reachable_without_obvious_capability_check"
+            )
+
+        if (
+            user_mutation
+            and not has_identity_check
+        ):
+            risk_reasons.append(
+                "ownership_or_target_identity_requires_analysis"
+            )
+
+        required_reasoning = [
+            "determine minimum attacker privilege",
+            "determine whether attacker controls target object identity",
+            "verify capability and ownership enforcement",
+            "determine security meaning of mutated state",
+            "trace downstream consumers of changed state",
+        ]
+
+        if password_transition:
+            required_reasoning.extend([
+                "verify password-reset token lifecycle",
+                "verify victim ownership proof",
+            ])
+
+        if role_transition:
+            required_reasoning.extend([
+                "determine reachable resulting role/capabilities",
+                "check subscriber-to-admin or equivalent privilege chain",
+            ])
+
+        if configuration_write:
+            required_reasoning.extend([
+                "trace configuration value to behavior changes",
+                "check whether configuration exposes new privileged surface",
+            ])
+
+        units.append({
+            "id": (
+                f"WP-V6-STATE-{counter:04d}"
+            ),
+            "kind": "security_state_transition",
+            "function": function_name,
+            "request_reachable": request_reachable,
+            "registrations": registrations_for_function,
+            "identity_transitions": identity,
+            "configuration_transitions": config,
+            "token_operations": tokens,
+            "authorization_controls": authorization,
+            "object_operations": objects,
+            "security_meta_hints": security_hints,
+            "risk_reasons": risk_reasons,
+            "required_reasoning": sorted(
+                set(required_reasoning)
+            ),
+            "status": "requires_semantic_review",
+        })
+
+    return units
+
+
+def build_v6_review_index(state_units):
+    """
+    Compact queue consumed by Codex.
+    """
+
+    queue = []
+
+    for unit in state_units:
+        score = 50
+
+        reasons = set(
+            unit.get("risk_reasons", [])
+        )
+
+        if "role_or_capability_transition" in reasons:
+            score += 70
+
+        if "password_or_reset_transition" in reasons:
+            score += 70
+
+        if "authentication_state_transition" in reasons:
+            score += 60
+
+        if "user_security_state_mutation" in reasons:
+            score += 40
+
+        if (
+            "security_relevant_configuration_transition"
+            in reasons
+        ):
+            score += 40
+
+        if (
+            "request_reachable_without_obvious_capability_check"
+            in reasons
+        ):
+            score += 50
+
+        if (
+            "ownership_or_target_identity_requires_analysis"
+            in reasons
+        ):
+            score += 40
+
+        if unit.get("request_reachable"):
+            score += 25
+
+        if score >= 180:
+            effort = "deep"
+        elif score >= 120:
+            effort = "normal"
+        else:
+            effort = "light"
+
+        queue.append({
+            "id": unit["id"],
+            "kind": unit["kind"],
+            "function": unit["function"],
+            "priority_score": score,
+            "review_effort": effort,
+            "request_reachable": unit[
+                "request_reachable"
+            ],
+            "risk_reasons": unit[
+                "risk_reasons"
+            ],
+            "required_reasoning": unit[
+                "required_reasoning"
+            ],
+            "security_meta_hints": unit[
+                "security_meta_hints"
+            ],
+        })
+
+    queue.sort(
+        key=lambda x: (
+            -x["priority_score"],
+            x["id"],
+        )
+    )
+
+    return queue
+
+
 # OUTPUT
 # ============================================================
 
@@ -6108,6 +6610,29 @@ def main():
         )
     )
 
+
+    # ------------------------------------------------------------
+    # V6 Security State Graph
+    # ------------------------------------------------------------
+
+    print("[*] Building V6 security state graph...")
+
+    v6_state_units = (
+        build_security_state_graph_v6(
+            plugin_root,
+            function_index,
+            resolved_registrations,
+            v5_review_units,
+            v5_gap_units,
+        )
+    )
+
+    v6_review_index = (
+        build_v6_review_index(
+            v6_state_units
+        )
+    )
+
     v5_output_dir = (
         Path("/opt/codex-security/wpsec-output")
         / plugin_root.name
@@ -6203,6 +6728,91 @@ def main():
     write_json(
         v5_output_dir / "security-graph.json",
         v5_security_graph
+    )
+
+
+    # ------------------------------------------------------------
+    # V6 output artifacts
+    # ------------------------------------------------------------
+
+    v6_output_dir = (
+        Path("/opt/codex-security/wpsec-output")
+        / plugin_root.name
+        / "v6"
+    )
+
+    v6_output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    v6_effort_counts = {}
+
+    for unit in v6_review_index:
+        effort = unit.get(
+            "review_effort",
+            "unknown"
+        )
+
+        v6_effort_counts[effort] = (
+            v6_effort_counts.get(
+                effort,
+                0
+            ) + 1
+        )
+
+    v6_reason_counts = {}
+
+    for unit in v6_state_units:
+        for reason in unit.get(
+            "risk_reasons",
+            []
+        ):
+            v6_reason_counts[reason] = (
+                v6_reason_counts.get(
+                    reason,
+                    0
+                ) + 1
+            )
+
+    v6_summary = {
+        "schema_version": "6.0",
+
+        "plugin":
+            plugin_root.name,
+
+        "security_state_units":
+            len(v6_state_units),
+
+        "review_units":
+            len(v6_review_index),
+
+        "review_effort":
+            v6_effort_counts,
+
+        "risk_reasons":
+            v6_reason_counts,
+
+        "purpose": (
+            "authorization, identity, ownership, "
+            "authentication, privilege and "
+            "security-state transition review"
+        ),
+    }
+
+    write_json(
+        v6_output_dir / "summary.json",
+        v6_summary
+    )
+
+    write_json(
+        v6_output_dir / "review-index.json",
+        v6_review_index
+    )
+
+    write_json(
+        v6_output_dir / "security-state-graph.json",
+        v6_state_units
     )
 
     print("[*] Generating candidates...")
