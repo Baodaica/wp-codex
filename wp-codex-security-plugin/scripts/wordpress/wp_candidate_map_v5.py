@@ -6479,6 +6479,1351 @@ def build_v6_review_index(state_units):
     return queue
 
 
+
+# ============================================================
+# V6.1 COVERAGE SAFETY NET
+#
+# Candidate/review-unit discovery is an optimization boundary,
+# never a security coverage boundary.
+#
+# This pass adds:
+#   1. reverse call reachability
+#   2. cross-state dependencies
+#   3. orphan security-sensitive review
+# ============================================================
+
+V61_SECURITY_NAME_HINTS = {
+    "admin",
+    "administrator",
+    "role",
+    "cap",
+    "capability",
+    "permission",
+    "privilege",
+    "access",
+    "owner",
+    "ownership",
+    "approve",
+    "approval",
+    "verify",
+    "verified",
+    "activate",
+    "activation",
+    "auth",
+    "authenticate",
+    "login",
+    "password",
+    "passwd",
+    "reset",
+    "token",
+    "secret",
+    "level",
+    "group",
+    "membership",
+    "account",
+    "user",
+    "register",
+    "registration",
+}
+
+V61_STATE_WRITE_HINTS = {
+    "update_option",
+    "add_option",
+    "delete_option",
+    "update_site_option",
+    "update_user_meta",
+    "add_user_meta",
+    "delete_user_meta",
+    "update_post_meta",
+    "add_post_meta",
+    "delete_post_meta",
+    "wp_update_user",
+    "wp_insert_user",
+    "wp_create_user",
+    "wp_set_password",
+    "set_role",
+    "add_role",
+    "remove_role",
+    "add_cap",
+    "remove_cap",
+}
+
+V61_STATE_READ_HINTS = {
+    "get_option",
+    "get_site_option",
+    "get_user_meta",
+    "get_post_meta",
+    "get_user_by",
+    "get_userdata",
+    "wp_get_current_user",
+    "current_user_can",
+    "user_can",
+    "is_user_logged_in",
+}
+
+V61_SECURITY_CONSUMER_HINTS = {
+    "wp_set_auth_cookie",
+    "wp_signon",
+    "wp_authenticate",
+    "wp_set_password",
+    "reset_password",
+    "wp_update_user",
+    "wp_insert_user",
+    "wp_create_user",
+    "set_role",
+    "add_role",
+    "add_cap",
+}
+
+
+def _v61_text(obj):
+    if obj is None:
+        return ""
+
+    if isinstance(obj, str):
+        return obj.lower()
+
+    try:
+        import json
+        return json.dumps(
+            obj,
+            ensure_ascii=False,
+            default=str,
+        ).lower()
+    except Exception:
+        return str(obj).lower()
+
+
+def _v61_security_name_score(name):
+    text = _v61_text(name)
+
+    score = 0
+    hits = []
+
+    for hint in V61_SECURITY_NAME_HINTS:
+        if hint in text:
+            score += 1
+            hits.append(hint)
+
+    return score, sorted(set(hits))
+
+
+def build_reverse_call_index_v61(function_index):
+    """
+    Lightweight reverse caller index.
+
+    This intentionally uses the mapper's already indexed function
+    representations rather than performing repository-wide model
+    discovery.
+
+    Output:
+        callee-name -> bounded caller descriptors
+    """
+
+    reverse = {}
+
+    if not isinstance(function_index, dict):
+        return reverse
+
+    known_names = set(
+        str(x)
+        for x in function_index.keys()
+    )
+
+    for caller_name, records in function_index.items():
+        if not isinstance(records, list):
+            records = [records]
+
+        for record in records:
+            text = _v61_text(record)
+
+            if not text:
+                continue
+
+            for callee in known_names:
+                if callee == caller_name:
+                    continue
+
+                # Cheap deterministic edge discovery. Semantic
+                # validation remains Codex's responsibility.
+                if (
+                    f"{callee.lower()}(" in text
+                    or f"::{callee.lower()}(" in text
+                    or f"->{callee.lower()}(" in text
+                ):
+                    reverse.setdefault(
+                        callee,
+                        []
+                    ).append({
+                        "caller": caller_name,
+                        "callee": callee,
+                        "evidence_kind":
+                            "indexed_call_reference",
+                    })
+
+    return reverse
+
+
+def reverse_reachability_v61(
+    start_function,
+    reverse_index,
+    max_depth=4,
+    max_nodes=80,
+):
+    """
+    Bounded reverse traversal.
+
+    We deliberately cap traversal so custom security abstractions
+    can be connected back toward exposure without recreating a
+    repository-wide semantic audit.
+    """
+
+    queue = [
+        (start_function, 0, [])
+    ]
+
+    seen = {start_function}
+    paths = []
+
+    while queue and len(seen) <= max_nodes:
+        current, depth, path = queue.pop(0)
+
+        if depth >= max_depth:
+            continue
+
+        for edge in reverse_index.get(
+            current,
+            []
+        ):
+            caller = edge.get("caller")
+
+            if not caller:
+                continue
+
+            new_path = path + [{
+                "caller": caller,
+                "callee": current,
+            }]
+
+            paths.append(new_path)
+
+            if caller not in seen:
+                seen.add(caller)
+                queue.append(
+                    (
+                        caller,
+                        depth + 1,
+                        new_path,
+                    )
+                )
+
+    return {
+        "start_function": start_function,
+        "max_depth": max_depth,
+        "visited_functions": sorted(seen),
+        "paths": paths,
+    }
+
+
+def discover_state_accesses_v61(function_index):
+    """
+    Discover generic state producers/readers/consumers.
+
+    This is intentionally broader than WordPress roles alone so
+    plugin-specific state abstractions can reach semantic review.
+    """
+
+    writes = []
+    reads = []
+    consumers = []
+
+    if not isinstance(function_index, dict):
+        return {
+            "writes": writes,
+            "reads": reads,
+            "consumers": consumers,
+        }
+
+    for function_name, records in function_index.items():
+        if not isinstance(records, list):
+            records = [records]
+
+        text = _v61_text(records)
+
+        name_score, name_hints = (
+            _v61_security_name_score(
+                function_name
+            )
+        )
+
+        write_hits = sorted(
+            x
+            for x in V61_STATE_WRITE_HINTS
+            if x.lower() in text
+        )
+
+        read_hits = sorted(
+            x
+            for x in V61_STATE_READ_HINTS
+            if x.lower() in text
+        )
+
+        consumer_hits = sorted(
+            x
+            for x in V61_SECURITY_CONSUMER_HINTS
+            if x.lower() in text
+        )
+
+        if write_hits:
+            writes.append({
+                "function": function_name,
+                "operations": write_hits,
+                "security_name_hints":
+                    name_hints,
+                "security_name_score":
+                    name_score,
+            })
+
+        if read_hits:
+            reads.append({
+                "function": function_name,
+                "operations": read_hits,
+                "security_name_hints":
+                    name_hints,
+                "security_name_score":
+                    name_score,
+            })
+
+        if consumer_hits:
+            consumers.append({
+                "function": function_name,
+                "operations": consumer_hits,
+                "security_name_hints":
+                    name_hints,
+                "security_name_score":
+                    name_score,
+            })
+
+    return {
+        "writes": writes,
+        "reads": reads,
+        "consumers": consumers,
+    }
+
+
+
+# ============================================================
+# V6.1.2 CONCRETE STATE-KEY EXTRACTION
+# ============================================================
+
+V612_STATE_KEY_PATTERNS = {
+    "option": [
+        r"""(?:get_option|update_option|add_option|delete_option)\s*\(\s*['"]([^'"]+)['"]""",
+        r"""(?:get_site_option|update_site_option|add_site_option|delete_site_option)\s*\(\s*['"]([^'"]+)['"]""",
+    ],
+
+    "user_meta": [
+        r"""(?:get_user_meta|update_user_meta|add_user_meta|delete_user_meta)\s*\([^,]+,\s*['"]([^'"]+)['"]""",
+    ],
+
+    "post_meta": [
+        r"""(?:get_post_meta|update_post_meta|add_post_meta|delete_post_meta)\s*\([^,]+,\s*['"]([^'"]+)['"]""",
+    ],
+}
+
+
+def extract_state_keys_v612(text):
+    import re
+
+    result = []
+
+    raw = str(text)
+
+    for storage, patterns in (
+        V612_STATE_KEY_PATTERNS.items()
+    ):
+        for pattern in patterns:
+            for m in re.finditer(
+                pattern,
+                raw,
+                re.I
+            ):
+                result.append({
+                    "storage": storage,
+                    "key": m.group(1),
+                })
+
+    unique = {}
+
+    for item in result:
+        k = (
+            item["storage"],
+            item["key"],
+        )
+
+        unique[k] = item
+
+    return list(unique.values())
+
+
+def discover_concrete_state_accesses_v612(
+    function_index
+):
+    writes = []
+    reads = []
+
+    if not isinstance(function_index, dict):
+        return {
+            "writes": [],
+            "reads": [],
+        }
+
+    for function_name, records in (
+        function_index.items()
+    ):
+        if not isinstance(records, list):
+            records = [records]
+
+        raw = str(records)
+
+        keys = extract_state_keys_v612(
+            raw
+        )
+
+        if not keys:
+            continue
+
+        low = raw.lower()
+
+        has_write = any(
+            x in low
+            for x in (
+                "update_option",
+                "add_option",
+                "delete_option",
+                "update_site_option",
+                "add_site_option",
+                "delete_site_option",
+                "update_user_meta",
+                "add_user_meta",
+                "delete_user_meta",
+                "update_post_meta",
+                "add_post_meta",
+                "delete_post_meta",
+            )
+        )
+
+        has_read = any(
+            x in low
+            for x in (
+                "get_option",
+                "get_site_option",
+                "get_user_meta",
+                "get_post_meta",
+            )
+        )
+
+        if has_write:
+            writes.append({
+                "function": function_name,
+                "keys": keys,
+            })
+
+        if has_read:
+            reads.append({
+                "function": function_name,
+                "keys": keys,
+            })
+
+    return {
+        "writes": writes,
+        "reads": reads,
+    }
+
+
+V613_SECURITY_STATE_KEY_HINTS = {
+    "admin",
+    "administrator",
+    "role",
+    "default_role",
+    "capability",
+    "capabilities",
+    "permission",
+    "privilege",
+    "access",
+    "auth",
+    "login",
+    "password",
+    "passwd",
+    "reset",
+    "token",
+    "secret",
+    "nonce",
+    "verify",
+    "verified",
+    "verification",
+    "approve",
+    "approved",
+    "approval",
+    "activate",
+    "activation",
+    "owner",
+    "ownership",
+    "registration",
+    "register",
+    "membership",
+    "account",
+}
+
+V613_EXACT_SECURITY_KEYS = {
+    "default_role",
+    "users_can_register",
+    "active_plugins",
+    "active_sitewide_plugins",
+    "administrator",
+    "wp_user_roles",
+}
+
+
+def state_key_security_score_v613(
+    storage,
+    key,
+):
+    """
+    Return a deterministic security-interest score for a concrete
+    persisted state key.
+
+    This is prioritization only, never proof of vulnerability.
+    """
+
+    low = str(key).lower()
+
+    score = 0
+    reasons = []
+
+    if low in V613_EXACT_SECURITY_KEYS:
+        score += 100
+        reasons.append(
+            "known_security_sensitive_key"
+        )
+
+    for hint in V613_SECURITY_STATE_KEY_HINTS:
+        if hint in low:
+            score += 25
+            reasons.append(
+                f"security_key_hint:{hint}"
+            )
+
+    if storage == "user_meta":
+        # User-meta state is more likely than generic options to
+        # encode account approval/role/identity state.
+        score += 10
+
+    return (
+        score,
+        sorted(set(reasons)),
+    )
+
+
+def function_security_signal_v613(
+    function_name,
+    function_index,
+):
+    """
+    Determine whether a producer/consumer itself has strong
+    authorization/identity/privilege semantics.
+    """
+
+    records = (
+        function_index.get(
+            function_name,
+            []
+        )
+        if isinstance(
+            function_index,
+            dict
+        )
+        else []
+    )
+
+    body = _v61_text(records)
+
+    name_score, name_hints = (
+        _v61_security_name_score(
+            function_name
+        )
+    )
+
+    api_hits = sorted({
+        x
+        for x in (
+            "current_user_can",
+            "user_can",
+            "map_meta_cap",
+            "wp_set_password",
+            "reset_password",
+            "check_password_reset_key",
+            "get_password_reset_key",
+            "wp_set_auth_cookie",
+            "wp_signon",
+            "wp_authenticate",
+            "set_role",
+            "add_role",
+            "remove_role",
+            "add_cap",
+            "remove_cap",
+            "wp_update_user",
+            "wp_insert_user",
+            "wp_create_user",
+            "update_user_meta",
+            "add_user_meta",
+            "delete_user_meta",
+        )
+        if x in body
+    })
+
+    strong = bool(
+        api_hits
+        or name_score >= 2
+    )
+
+    return {
+        "strong": strong,
+        "name_hints": name_hints,
+        "api_hits": api_hits,
+    }
+
+
+def build_concrete_cross_state_v612(
+    function_index
+):
+    """
+    V6.1.3 model-facing cross-state graph.
+
+    Requirements:
+      - same concrete storage + key; AND
+      - security-relevant state key OR strong security semantics
+        in producer/consumer.
+
+    Dependencies are grouped by producer + concrete state key so
+    common options do not create O(writer * reader) model units.
+    """
+
+    accesses = (
+        discover_concrete_state_accesses_v612(
+            function_index
+        )
+    )
+
+    writers = accesses["writes"]
+    readers = accesses["reads"]
+
+    # Build reader index:
+    #
+    # (storage, key) -> set(functions)
+    reader_index = {}
+
+    for reader in readers:
+        for item in reader.get(
+            "keys",
+            []
+        ):
+            state = (
+                item["storage"],
+                item["key"],
+            )
+
+            reader_index.setdefault(
+                state,
+                set()
+            ).add(
+                reader["function"]
+            )
+
+    result = []
+    counter = 0
+    seen = set()
+
+    for writer in writers:
+        producer = writer["function"]
+
+        producer_signal = (
+            function_security_signal_v613(
+                producer,
+                function_index,
+            )
+        )
+
+        for item in writer.get(
+            "keys",
+            []
+        ):
+            storage = item["storage"]
+            key = item["key"]
+
+            state = (
+                storage,
+                key,
+            )
+
+            consumers = sorted(
+                reader_index.get(
+                    state,
+                    set()
+                )
+            )
+
+            if not consumers:
+                continue
+
+            key_score, key_reasons = (
+                state_key_security_score_v613(
+                    storage,
+                    key,
+                )
+            )
+
+            consumer_details = []
+
+            any_strong_consumer = False
+
+            for consumer in consumers:
+                signal = (
+                    function_security_signal_v613(
+                        consumer,
+                        function_index,
+                    )
+                )
+
+                if signal["strong"]:
+                    any_strong_consumer = True
+
+                consumer_details.append({
+                    "function":
+                        consumer,
+
+                    "security_signal":
+                        signal,
+                })
+
+            # V6.1.4:
+            #
+            # Exact-key equality proves a data dependency, but does
+            # not prove the state is security relevant.
+            #
+            # Generic operational state such as timezone, cache,
+            # appearance, price formatting, or database prefixes
+            # must not enter the primary model queue merely because
+            # one of many consumers happens to contain a security
+            # API.
+            #
+            # Primary promotion requires:
+            #
+            #   1. an explicitly security-relevant concrete key; OR
+            #   2. user/post metadata where both sides exhibit
+            #      strong security semantics.
+            #
+            # All other concrete dependencies remain available in
+            # fallback evidence.
+
+            explicit_security_key = (
+                key_score > 0
+            )
+
+            strong_object_state = (
+                storage in {
+                    "user_meta",
+                    "post_meta",
+                }
+                and producer_signal["strong"]
+                and any_strong_consumer
+            )
+
+            if not (
+                explicit_security_key
+                or strong_object_state
+            ):
+                continue
+
+            identity = (
+                producer,
+                storage,
+                key,
+            )
+
+            if identity in seen:
+                continue
+
+            seen.add(identity)
+            counter += 1
+
+            priority = (
+                50
+                + min(key_score, 100)
+            )
+
+            if producer_signal["strong"]:
+                priority += 30
+
+            if any_strong_consumer:
+                priority += 30
+
+            if storage == "user_meta":
+                priority += 15
+
+            effort = (
+                "deep"
+                if priority >= 150
+                else
+                "normal"
+                if priority >= 100
+                else
+                "light"
+            )
+
+            result.append({
+                "id":
+                    f"WP-V613-STATE-{counter:04d}",
+
+                "producer":
+                    producer,
+
+                "state": {
+                    "storage": storage,
+                    "key": key,
+                },
+
+                "consumers":
+                    consumer_details,
+
+                "consumer_count":
+                    len(consumer_details),
+
+                "priority_score":
+                    priority,
+
+                "review_effort":
+                    effort,
+
+                "confidence":
+                    "concrete_state_key",
+
+                "security_key_reasons":
+                    key_reasons,
+
+                "producer_security_signal":
+                    producer_signal,
+
+                "status":
+                    "requires_semantic_validation",
+
+                "required_resolution": [
+                    "determine whether attacker can influence the state producer",
+                    "determine producer authorization and minimum attacker privilege",
+                    "determine whether producer and consumers operate in the same WordPress scope and target object",
+                    "determine the security meaning of the concrete persisted state",
+                    "determine whether any consumer changes authentication, authorization, privilege, identity, approval, verification, ownership, registration, or another security boundary",
+                    "check whether exploitation spans multiple requests",
+                    "reject the unit with source-backed evidence when the state is operational rather than security-sensitive",
+                ],
+            })
+
+    result.sort(
+        key=lambda x: (
+            -x["priority_score"],
+            x["id"],
+        )
+    )
+
+    return result
+
+
+def build_cross_state_dependencies_v61(
+    state_accesses,
+):
+    """
+    Produce compact producer -> reader/consumer hypotheses.
+
+    These are review hypotheses, not confirmed dataflows.
+
+    Codex must validate the concrete key/field/object and whether
+    attacker-controlled state actually influences the consumer.
+    """
+
+    writes = state_accesses.get(
+        "writes",
+        []
+    )
+
+    reads = state_accesses.get(
+        "reads",
+        []
+    )
+
+    consumers = state_accesses.get(
+        "consumers",
+        []
+    )
+
+    dependencies = []
+    counter = 0
+
+    for writer in writes:
+        writer_hints = set(
+            writer.get(
+                "security_name_hints",
+                []
+            )
+        )
+
+        for reader in reads:
+            reader_hints = set(
+                reader.get(
+                    "security_name_hints",
+                    []
+                )
+            )
+
+            overlap = sorted(
+                writer_hints & reader_hints
+            )
+
+            if not overlap:
+                continue
+
+            counter += 1
+
+            dependencies.append({
+                "id":
+                    f"WP-V61-STATE-{counter:04d}",
+                "producer":
+                    writer["function"],
+                "consumer":
+                    reader["function"],
+                "shared_semantic_hints":
+                    overlap,
+                "producer_operations":
+                    writer.get(
+                        "operations",
+                        []
+                    ),
+                "consumer_operations":
+                    reader.get(
+                        "operations",
+                        []
+                    ),
+                "status":
+                    "requires_semantic_validation",
+                "required_resolution": [
+                    "identify the concrete state key, field, object, or custom storage",
+                    "prove whether producer and consumer reference the same security state",
+                    "determine attacker control over the producer",
+                    "determine the downstream authorization, identity, privilege, or authentication consequence",
+                    "check cross-request and cross-user behavior",
+                ],
+            })
+
+        for consumer in consumers:
+            consumer_hints = set(
+                consumer.get(
+                    "security_name_hints",
+                    []
+                )
+            )
+
+            overlap = sorted(
+                writer_hints & consumer_hints
+            )
+
+            if not overlap:
+                continue
+
+            counter += 1
+
+            dependencies.append({
+                "id":
+                    f"WP-V61-STATE-{counter:04d}",
+                "producer":
+                    writer["function"],
+                "consumer":
+                    consumer["function"],
+                "shared_semantic_hints":
+                    overlap,
+                "producer_operations":
+                    writer.get(
+                        "operations",
+                        []
+                    ),
+                "consumer_operations":
+                    consumer.get(
+                        "operations",
+                        []
+                    ),
+                "status":
+                    "requires_semantic_validation",
+                "required_resolution": [
+                    "resolve the concrete state dependency",
+                    "determine whether the state survives across requests",
+                    "determine attacker privilege and target identity",
+                    "validate whether the consumer grants security-sensitive behavior",
+                    "check capability, ownership, authentication and business authorization independently",
+                ],
+            })
+
+    return dependencies
+
+
+def build_orphan_security_queue_v61(
+    function_index,
+    reverse_index,
+    v5_review_index,
+    v6_review_index,
+):
+    """
+    Security-sensitive functions not already represented by V5/V6
+    become explicit review units instead of silently disappearing.
+    """
+
+    represented = _v61_text(
+        {
+            "v5": v5_review_index,
+            "v6": v6_review_index,
+        }
+    )
+
+    queue = []
+    counter = 0
+
+    if not isinstance(function_index, dict):
+        return queue
+
+    for function_name, records in function_index.items():
+        name_score, name_hints = (
+            _v61_security_name_score(
+                function_name
+            )
+        )
+
+        body = _v61_text(records)
+
+        state_write_hits = sorted(
+            x
+            for x in V61_STATE_WRITE_HINTS
+            if x.lower() in body
+        )
+
+        state_read_hits = sorted(
+            x
+            for x in V61_STATE_READ_HINTS
+            if x.lower() in body
+        )
+
+        # V6.1.3:
+        # Security-like naming is only a discovery hint.
+        # Require structural evidence before exposing an orphan
+        # unit to the model-facing queue.
+
+        has_db_mutation = (
+            "$wpdb" in body
+            and any(
+                x in body
+                for x in (
+                    "insert",
+                    "update",
+                    "delete",
+                    "replace",
+                    "query",
+                )
+            )
+        )
+
+        has_security_transition = bool(
+            state_write_hits
+        )
+
+        has_identity_read = bool(
+            state_read_hits
+        )
+
+        has_security_api = any(
+            x in body
+            for x in (
+                "current_user_can",
+                "user_can",
+                "map_meta_cap",
+                "wp_set_password",
+                "reset_password",
+                "check_password_reset_key",
+                "get_password_reset_key",
+                "wp_set_auth_cookie",
+                "wp_signon",
+                "wp_authenticate",
+                "set_role",
+                "add_role",
+                "remove_role",
+                "add_cap",
+                "remove_cap",
+                "update_user_meta",
+                "add_user_meta",
+                "delete_user_meta",
+                "wp_update_user",
+                "wp_insert_user",
+                "wp_create_user",
+            )
+        )
+
+        has_target_identity_signal = any(
+            x in body
+            for x in (
+                "user_id",
+                "userid",
+                "account_id",
+                "member_id",
+                "owner_id",
+                "target_user",
+                "target_id",
+                "role",
+                "capability",
+                "permission",
+                "password",
+                "reset_key",
+                "token",
+            )
+        )
+
+        reverse_probe = (
+            reverse_reachability_v61(
+                function_name,
+                reverse_index,
+                max_depth=2,
+                max_nodes=30,
+            )
+        )
+
+        has_reverse_path = bool(
+            reverse_probe.get(
+                "paths"
+            )
+        )
+
+        strong_structural_signal = bool(
+            has_security_transition
+            or has_db_mutation
+            or has_security_api
+            or (
+                has_identity_read
+                and has_target_identity_signal
+            )
+            or (
+                name_score >= 2
+                and has_reverse_path
+                and has_target_identity_signal
+            )
+        )
+
+        custom_security_signal = (
+            name_score > 0
+            and strong_structural_signal
+        )
+
+        if not custom_security_signal:
+            continue
+
+        if function_name.lower() in represented:
+            continue
+
+        counter += 1
+
+        reverse = reverse_reachability_v61(
+            function_name,
+            reverse_index,
+        )
+
+        score = (
+            70
+            + min(name_score * 10, 50)
+            + min(
+                len(state_write_hits) * 15,
+                45,
+            )
+        )
+
+        if reverse["paths"]:
+            score += 20
+
+        effort = (
+            "deep"
+            if score >= 130
+            else
+            "normal"
+            if score >= 90
+            else
+            "light"
+        )
+
+        queue.append({
+            "id":
+                f"WP-V61-ORPHAN-{counter:04d}",
+            "function":
+                function_name,
+            "priority_score":
+                score,
+            "review_effort":
+                effort,
+            "security_name_hints":
+                name_hints,
+            "state_write_operations":
+                state_write_hits,
+            "state_read_operations":
+                state_read_hits,
+            "reverse_reachability":
+                reverse,
+            "status":
+                "requires_semantic_validation",
+            "risk_reasons": [
+                "security_sensitive_code_outside_primary_v5_v6_queue",
+                "custom_security_abstraction_requires_analysis",
+            ],
+            "required_resolution": [
+                "determine whether the function is request reachable",
+                "resolve callers using the bounded reverse graph",
+                "determine attacker privilege and controlled parameters",
+                "determine whether the state represents authorization, identity, ownership, privilege, authentication, approval, verification, or another security boundary",
+                "follow concrete downstream consumers when security impact is plausible",
+                "do not report solely from naming or heuristic signals",
+            ],
+        })
+
+    queue.sort(
+        key=lambda x: (
+            -x["priority_score"],
+            x["id"],
+        )
+    )
+
+    return queue
+
+
+
+def partition_orphan_queue_v614(
+    orphan_queue
+):
+    """
+    Split orphan discoveries into initial semantic review and
+    fallback coverage hypotheses.
+
+    No unit is discarded.
+
+    Light units remain available for escalation and completeness
+    accounting but are not automatically loaded into initial model
+    context.
+    """
+
+    primary = []
+    fallback = []
+
+    for unit in orphan_queue:
+        effort = unit.get(
+            "review_effort",
+            "light"
+        )
+
+        if effort in {
+            "deep",
+            "normal",
+        }:
+            primary.append(unit)
+        else:
+            fallback.append(unit)
+
+    return {
+        "primary": primary,
+        "fallback": fallback,
+    }
+
+
+def build_coverage_safety_net_v61(
+    function_index,
+    v5_review_index,
+    v6_review_index,
+):
+    reverse_index = (
+        build_reverse_call_index_v61(
+            function_index
+        )
+    )
+
+    state_accesses = (
+        discover_state_accesses_v61(
+            function_index
+        )
+    )
+
+    # Concrete shared state keys are the preferred
+    # model-facing cross-request dependency source.
+    concrete_cross_state = (
+        build_concrete_cross_state_v612(
+            function_index
+        )
+    )
+
+    # Retain the older semantic-only graph locally as a
+    # fallback hypothesis source, but do not treat it as
+    # equally strong evidence.
+    semantic_cross_state = (
+        build_cross_state_dependencies_v61(
+            state_accesses
+        )
+    )
+
+    cross_state = (
+        concrete_cross_state
+    )
+
+    orphan_queue = (
+        build_orphan_security_queue_v61(
+            function_index,
+            reverse_index,
+            v5_review_index,
+            v6_review_index,
+        )
+    )
+
+
+    orphan_partition = (
+        partition_orphan_queue_v614(
+            orphan_queue
+        )
+    )
+
+    return {
+        "schema_version": "6.1",
+        "reverse_call_index":
+            reverse_index,
+        "state_accesses":
+            state_accesses,
+        "cross_state_dependencies":
+            cross_state,
+
+        # Model-facing concrete security-state dependencies.
+        "cross_state_primary":
+            cross_state,
+
+        # Broad semantic hypotheses are retained locally as a
+        # coverage fallback. They are not initial model context.
+        "semantic_cross_state_hypotheses":
+            semantic_cross_state,
+
+        "orphan_review_queue":
+            orphan_partition["primary"],
+
+        "orphan_fallback_hypotheses":
+            orphan_partition["fallback"],
+
+        "orphan_all":
+            orphan_queue,
+    }
+
 # OUTPUT
 # ============================================================
 
@@ -6631,6 +7976,33 @@ def main():
         build_v6_review_index(
             v6_state_units
         )
+    )
+
+
+    # ------------------------------------------------------------
+    # V6.1 Coverage Safety Net
+    # ------------------------------------------------------------
+
+    print("[*] Building V6.1 coverage safety net...")
+
+    v61_coverage = (
+        build_coverage_safety_net_v61(
+            function_index,
+            v5_review_index,
+            v6_review_index,
+        )
+    )
+
+    v61_orphan_review_index = (
+        v61_coverage[
+            "orphan_review_queue"
+        ]
+    )
+
+    v61_cross_state_index = (
+        v61_coverage[
+            "cross_state_dependencies"
+        ]
     )
 
     v5_output_dir = (
@@ -6813,6 +8185,120 @@ def main():
     write_json(
         v6_output_dir / "security-state-graph.json",
         v6_state_units
+    )
+
+
+    # ------------------------------------------------------------
+    # V6.1 output artifacts
+    # ------------------------------------------------------------
+
+    v61_output_dir = (
+        Path("/opt/codex-security/wpsec-output")
+        / plugin_root.name
+        / "v6.1"
+    )
+
+    v61_output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    v61_summary = {
+        "schema_version": "6.1",
+
+        "plugin":
+            plugin_root.name,
+
+        "orphan_review_units":
+            len(
+                v61_orphan_review_index
+            ),
+
+        "cross_state_dependencies":
+            len(
+                v61_cross_state_index
+            ),
+
+        "reverse_indexed_callees":
+            len(
+                v61_coverage.get(
+                    "reverse_call_index",
+                    {}
+                )
+            ),
+
+        "state_writers":
+            len(
+                v61_coverage.get(
+                    "state_accesses",
+                    {}
+                ).get(
+                    "writes",
+                    []
+                )
+            ),
+
+        "state_readers":
+            len(
+                v61_coverage.get(
+                    "state_accesses",
+                    {}
+                ).get(
+                    "reads",
+                    []
+                )
+            ),
+
+        "security_consumers":
+            len(
+                v61_coverage.get(
+                    "state_accesses",
+                    {}
+                ).get(
+                    "consumers",
+                    []
+                )
+            ),
+
+        "purpose": (
+            "coverage safety net for custom, "
+            "reverse-reachable, and cross-state "
+            "security logic"
+        ),
+    }
+
+    write_json(
+        v61_output_dir
+        / "summary.json",
+        v61_summary
+    )
+
+    write_json(
+        v61_output_dir
+        / "orphan-review-index.json",
+        v61_orphan_review_index
+    )
+
+
+    write_json(
+        v61_output_dir
+        / "orphan-fallback-index.json",
+        v61_coverage.get(
+            "orphan_fallback_hypotheses",
+            []
+        )
+    )
+
+    write_json(
+        v61_output_dir
+        / "cross-state-index.json",
+        v61_cross_state_index
+    )
+
+    write_json(
+        v61_output_dir
+        / "coverage-safety-net.json",
+        v61_coverage
     )
 
     print("[*] Generating candidates...")

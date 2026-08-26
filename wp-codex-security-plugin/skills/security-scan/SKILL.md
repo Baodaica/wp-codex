@@ -808,3 +808,232 @@ Codex remains responsible for:
 - severity;
 - confidence.
 
+
+## WordPress V6.1 Coverage Safety Net
+
+Candidate and state-unit mapping are prioritization mechanisms, not
+security coverage boundaries.
+
+When `wpsec-output/<PLUGIN>/v6.1/` exists, use the V6.1 artifacts after
+the primary V5 and V6 queues.
+
+### Orphan security queue
+
+Review every item in:
+
+`v6.1/orphan-review-index.json`
+
+unless deterministic evidence proves that the unit is already represented
+by a primary review unit.
+
+An orphan unit means security-sensitive or security-like custom code was
+identified but was not confidently connected to the primary V5/V6 queue.
+
+Do not treat an orphan unit as a vulnerability.
+
+For each orphan unit:
+
+1. resolve bounded reverse callers;
+2. determine request reachability;
+3. determine attacker privilege;
+4. determine attacker-controlled parameters;
+5. determine target identity or object;
+6. determine the actual state semantics;
+7. follow concrete downstream security consumers when necessary.
+
+Do not perform a repository-wide semantic audit merely because an orphan
+exists.
+
+### Reverse security reachability
+
+Security-sensitive custom functions may be discovered before their public
+entrypoint is known.
+
+Use the bounded reverse-call evidence to work from:
+
+security-sensitive operation
+<- helper
+<- caller
+<- request entrypoint
+
+Expand only along concrete source-backed caller relationships required to
+resolve the security path.
+
+### Cross-request state dependencies
+
+Review every plausible item in:
+
+`v6.1/cross-state-index.json`
+
+as a state-dependency hypothesis.
+
+Determine whether a producer and consumer actually share the same:
+
+- option;
+- meta key;
+- custom database field;
+- account state;
+- role or capability state;
+- approval or verification state;
+- authentication state;
+- plugin-specific security state.
+
+Explicitly consider:
+
+request A
+-> attacker-controlled state mutation
+-> persisted state
+-> request B
+-> security-sensitive consumer
+-> privilege/authentication/authorization consequence
+
+A shared semantic hint is not sufficient proof. Validate the concrete
+state key or object before reporting.
+
+### Custom security abstractions
+
+Do not require WordPress core primitives to recognize a possible security
+boundary.
+
+Custom abstractions such as:
+
+- grant_access
+- set_level
+- approve_member
+- verify_account
+- activate_user
+- change_owner
+- promote_member
+- update_membership
+
+may implement security-sensitive state using custom tables, custom objects,
+or wrapper functions.
+
+Naming is only a discovery signal.
+
+Codex must determine actual semantics from source before accepting or
+rejecting the path.
+
+### Completeness rule
+
+A WordPress scan must not be marked complete solely because all V5
+candidates or V6 state units were reviewed.
+
+When V6.1 artifacts exist, completion additionally requires:
+
+- every orphan review unit has a disposition;
+- every material cross-state hypothesis has a disposition;
+- unresolved reverse-reachability paths are either resolved, explicitly
+  excluded with evidence, or reported unresolved/deferred;
+- no security-sensitive custom unit was silently discarded because it was
+  outside the primary candidate queue.
+
+The deterministic mapper provides coverage guidance.
+
+Codex semantic validation remains the authority for vulnerability
+existence, exploitability, business impact, severity, and confidence.
+
+## WordPress V6.1.4 Primary and Fallback Review Queues
+
+When V6.1.4 coverage artifacts are available, treat them as a
+two-tier semantic review system.
+
+### Primary review context
+
+Use these artifacts as initial model-facing security review context:
+
+- V5 candidate review units;
+- V6 security-state review units;
+- V6.1.4 primary orphan review units;
+- V6.1.4 promoted cross-state dependencies;
+- unresolved entrypoints and callbacks already identified by the mapper.
+
+Primary queues are prioritized security hypotheses, not confirmed
+vulnerabilities.
+
+Validate them from source before reporting.
+
+### Fallback coverage
+
+The following artifacts preserve broader security coverage without
+requiring all hypotheses to be loaded into initial model context:
+
+- orphan-fallback-index.json;
+- semantic_cross_state_hypotheses in coverage-safety-net.json;
+- reverse-call information;
+- unresolved or partially resolved mapper evidence.
+
+Fallback evidence must remain available for targeted expansion.
+
+Do not interpret absence from the primary queue as evidence that code is
+safe or irrelevant.
+
+### When to expand fallback evidence
+
+Expand relevant fallback evidence when primary review reveals:
+
+- unresolved authorization or capability semantics;
+- custom permission callbacks;
+- attacker-controlled identifiers, tokens, keys, roles, or capabilities;
+- authentication or ownership transitions;
+- privilege or role mutations;
+- account activation, registration, recovery, or reset flows;
+- state written in one component and consumed by another security-sensitive
+  component;
+- custom abstractions whose security semantics cannot be determined from
+  primary context;
+- unexplained callers or callees on a plausible attacker-to-impact path.
+
+Expansion should be targeted to the concrete security question rather than
+loading all fallback hypotheses indiscriminately.
+
+### Cross-state interpretation
+
+Promoted cross-state units represent state relationships worth immediate
+semantic review.
+
+They are not vulnerabilities merely because a producer and consumer share
+security-relevant state.
+
+Codex must establish:
+
+1. attacker reachability to the producer;
+2. attacker control over the relevant state;
+3. missing or insufficient authorization, ownership, nonce, or validation
+   controls;
+4. a concrete downstream security consumer;
+5. attacker-to-impact reachability.
+
+Generic configuration state should not be promoted merely because many
+functions consume it.
+
+### Orphan interpretation
+
+Primary orphan units represent security-sensitive custom code outside the
+main V5/V6 queues.
+
+Fallback orphan units remain coverage hypotheses.
+
+Permission callbacks and custom authorization helpers must not be assumed
+safe merely because they were placed in fallback.
+
+When an entrypoint depends on such a helper, inspect that helper directly.
+
+### Completion
+
+A WordPress scan using V6.1.4 may be marked complete only when:
+
+- all primary V5/V6/V6.1.4 review units have dispositions;
+- material unresolved entrypoints and callbacks have dispositions;
+- relevant fallback evidence has been expanded where primary analysis
+  requires it;
+- plausible cross-state attack chains have been resolved;
+- custom authorization and ownership logic required by reachable paths has
+  been validated;
+- no security-sensitive path has been silently discarded solely because it
+  was assigned to a fallback queue.
+
+The deterministic mapper prioritizes review.
+
+Codex semantic reasoning remains responsible for determining whether a
+real vulnerability exists.
