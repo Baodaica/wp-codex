@@ -141,9 +141,12 @@ SINK_PATTERNS = {
         re.compile(r"\bfile_put_contents\s*\("),
         re.compile(r"\bmove_uploaded_file\s*\("),
         re.compile(r"\bwp_handle_upload\s*\("),
+        re.compile(r"\bwp_upload_bits\s*\("),
         re.compile(r"\bfopen\s*\("),
         re.compile(r"\bcopy\s*\("),
         re.compile(r"\brename\s*\("),
+        re.compile(r"\bmkdir\s*\("),
+        re.compile(r"\btouch\s*\("),
     ],
 
     "file_read": [
@@ -156,6 +159,7 @@ SINK_PATTERNS = {
     "file_delete": [
         re.compile(r"\bunlink\s*\("),
         re.compile(r"\brmdir\s*\("),
+        re.compile(r"\bwp_delete_file\s*\("),
     ],
 
     "include": [
@@ -172,11 +176,26 @@ SINK_PATTERNS = {
         re.compile(r"\bpassthru\s*\("),
         re.compile(r"\bproc_open\s*\("),
         re.compile(r"\bpopen\s*\("),
+        re.compile(r"\bpcntl_exec\s*\("),
+    ],
+
+    # Direct PHP dynamic-code sinks. These are kept separate so the
+    # semantic reviewer can distinguish PHP code execution from OS commands.
+    "code_injection": [
+        re.compile(r"\beval\s*\("),
+        re.compile(r"\bcreate_function\s*\("),
     ],
 
     "deserialization": [
         re.compile(r"\bunserialize\s*\("),
         re.compile(r"\bmaybe_unserialize\s*\("),
+    ],
+
+    # Dynamic invocation is not automatically RCE, but it is a high-value
+    # authorization/dataflow boundary and must remain visible to review.
+    "dynamic_invocation": [
+        re.compile(r"\bcall_user_func\s*\("),
+        re.compile(r"\bcall_user_func_array\s*\("),
     ],
 }
 
@@ -190,7 +209,9 @@ FAMILY_MAP = {
     "file_delete": "arbitrary_file_deletion",
     "include": "lfi_or_rfi",
     "command_execution": "command_execution_or_rce",
+    "code_injection": "code_injection",
     "deserialization": "unsafe_deserialization",
+    "dynamic_invocation": "dynamic_invocation",
 }
 
 
@@ -1605,6 +1626,10 @@ SINK_TO_EFFECTS = {
     ],
 
     "command_execution": [
+        "code_execution",
+    ],
+
+    "code_injection": [
         "code_execution",
     ],
 
@@ -5729,9 +5754,48 @@ def enrich_review_units_with_flow_v5(
     return result
 
 
+HIGH_IMPACT_V5_EFFECTS = {
+    "code_execution",
+    "dynamic_include",
+    "deserialization",
+    "dynamic_invocation",
+    "configuration_write",
+    "database_write",
+    "file_write",
+    "file_upload",
+    "file_delete",
+    "role_change",
+    "capability_change",
+    "session_change",
+    "object_update",
+    "object_delete",
+    "secret_read",
+}
+
+
+def v5_access_is_low_privilege(unit):
+    access = str(unit.get("minimum_access") or "").lower()
+    surface = str(unit.get("surface_class") or "").lower()
+    hook = str(unit.get("hook") or "").lower()
+
+    return access in {
+        "unauthenticated",
+        "public",
+        "unknown_permission_callback",
+        "permission_callback_requires_analysis",
+        "subscriber",
+        "contributor",
+        "author",
+    } or "nopriv" in hook or surface == "known_public"
+
+
 def v5_review_priority(unit):
     """
     Model-work priority, not vulnerability severity.
+
+    A priority label never suppresses a unit. High-impact effects receive
+    a conservative deep-review floor on public/low-privilege surfaces and
+    whenever deterministic flow is unknown.
     """
 
     flow = (
@@ -5775,20 +5839,7 @@ def v5_review_priority(unit):
     if signals.get("object_lookup"):
         score += 25
 
-    high_effects = {
-        "code_execution",
-        "dynamic_include",
-        "deserialization",
-        "configuration_write",
-        "file_write",
-        "file_upload",
-        "file_delete",
-        "role_change",
-        "capability_change",
-        "session_change",
-        "object_update",
-        "object_delete",
-        "secret_read",
+    high_effects = HIGH_IMPACT_V5_EFFECTS | {
         "payment_state_change",
     }
 
@@ -5807,16 +5858,29 @@ def v5_review_priority(unit):
 
     if score >= 120:
         label = "deep"
-
     elif score >= 80:
         label = "normal"
-
     else:
         label = "bounded"
+
+    high_impact = bool(effects & HIGH_IMPACT_V5_EFFECTS)
+    low_privilege = v5_access_is_low_privilege(unit)
+    flow_unknown = flow == "unknown"
+
+    # Recall-first safety floor. A dangerous sink on an exposed/unknown path
+    # must get semantic review even when heuristics cannot prove the flow.
+    if high_impact and (low_privilege or flow_unknown):
+        label = "deep"
 
     return {
         "score": score,
         "review_effort": label,
+        "coverage_floor": (
+            "deep"
+            if high_impact and (low_privilege or flow_unknown)
+            else "none"
+        ),
+        "must_review": True,
     }
 
 
@@ -5850,6 +5914,9 @@ def build_review_index_v5(
 
             "review_effort":
                 priority["review_effort"],
+            "coverage_floor":
+                priority.get("coverage_floor", "none"),
+            "must_review": True,
 
             "surface_class":
                 unit.get("surface_class"),
@@ -7824,6 +7891,262 @@ def build_coverage_safety_net_v61(
             orphan_queue,
     }
 
+# ============================================================
+# SEMANTIC REVIEW CORRELATOR / MODEL WORK PACKS
+#
+# This layer reduces repeated model context without suppressing
+# any V5/V6/V6.1 review unit. A pack is a batching/context unit,
+# NOT a finding and NOT a safety verdict.
+# ============================================================
+
+SECURITY_REVIEW_PACK_ORDER = [
+    "public_filesystem_execution",
+    "public_configuration_mutation",
+    "identity_auth_authorization",
+    "user_state_mutation",
+    "configuration_lifecycle",
+    "operational_state",
+    "secret_verification",
+        "other_security_logic",
+]
+
+
+def _review_pack_text(obj):
+    return _v61_text(obj)
+
+
+def _review_pack_themes(unit):
+    """Return conservative semantic themes for batching only.
+
+    Themes are derived from generic security effects, reasons, hints, and
+    security-related text. Do not key batching on a particular plugin's
+    function/class names or business workflow.
+    """
+    text = _review_pack_text(unit).lower()
+    themes = set()
+
+    effects = set(unit.get("effects", [])) if isinstance(unit, dict) else set()
+    reasons = set(unit.get("risk_reasons", [])) if isinstance(unit, dict) else set()
+    hints = set(unit.get("security_meta_hints", [])) if isinstance(unit, dict) else set()
+    hints |= set(unit.get("security_name_hints", [])) if isinstance(unit, dict) else set()
+    hints = {str(x).lower() for x in hints}
+
+    if effects & {
+        "file_read", "file_write", "file_upload", "file_delete",
+        "dynamic_include", "code_execution", "dynamic_invocation",
+    }:
+        themes.add("filesystem_code_execution")
+
+    if "configuration_write" in effects or any(x in text for x in (
+        "configuration", "option", "setting", "config",
+    )):
+        themes.add("configuration_mutation")
+
+    if any(x in reasons for x in {
+        "role_or_capability_transition",
+        "password_or_reset_transition",
+        "authentication_state_transition",
+    }) or any(x in text for x in (
+        "authorization", "capability", "password", "reset",
+        "authentication", "current_user_can", "user_can",
+    )):
+        themes.add("identity_auth_authorization")
+
+    if "user_security_state_mutation" in reasons or any(x in text for x in (
+        "usermeta", "user_meta", "ownership", "target identity",
+        "account state", "user state",
+    )):
+        themes.add("user_state_mutation")
+
+    if any(x in reasons for x in {
+        "state_transition", "security_sensitive_state_change",
+        "configuration_lifecycle",
+    }) or any(x in text for x in (
+        "state transition", "state change", "lifecycle",
+    )):
+        themes.add("security_state_transition")
+
+    if any(x in hints for x in {
+        "secret", "token", "credential", "verification", "verify",
+    }) or any(x in text for x in (
+        "secret", "token", "credential", "verification",
+    )):
+        themes.add("secret_verification")
+
+    if not themes:
+        themes.add("other_security_logic")
+
+    return themes
+
+
+def _review_pack_effort(units):
+    ranks = {"light": 1, "bounded": 1, "normal": 2, "deep": 3}
+    best = max((ranks.get(x.get("review_effort"), 1) for x in units), default=1)
+    return {1: "light", 2: "normal", 3: "deep"}[best]
+
+
+def build_semantic_review_packs_v62(v5_review_index, v6_review_index, v61_orphan_review_index, v61_fallback_index):
+    """
+    Build model-facing work packs while retaining every raw unit.
+
+    Safety invariants:
+      - no unit is discarded;
+      - every raw unit id appears in exactly one pack;
+      - no unit is declared safe by grouping;
+      - disposition remains member-level;
+      - fallback remains separate and can be promoted;
+      - deep units remain isolated;
+      - normal/light primary packs are separated and bounded;
+      - a pack's effort is the maximum member effort.
+    """
+    # The same logical unit can be emitted by multiple V6.1 queues. Build a
+    # canonical representation instead of allowing queue overlap to become
+    # duplicate model-facing memberships. Fallback wins over orphan because
+    # it is the stronger coverage classification for the same logical unit.
+    source_priority = {
+        "v5": 1,
+        "v6": 2,
+        "v6.1_orphan": 3,
+        "v6.1_fallback": 4,
+    }
+    canonical_units = {}
+    provenance = defaultdict(list)
+
+    for source_name, items in (
+        ("v5", v5_review_index),
+        ("v6", v6_review_index),
+        ("v6.1_orphan", v61_orphan_review_index),
+        ("v6.1_fallback", v61_fallback_index),
+    ):
+        for item in items or []:
+            unit_id = item.get("id")
+            if not unit_id:
+                continue
+            provenance[unit_id].append(source_name)
+            current = canonical_units.get(unit_id)
+            if current is None or source_priority[source_name] > source_priority[current[0]]:
+                canonical_units[unit_id] = (source_name, item)
+
+    sources = []
+    for unit_id, (source_name, item) in canonical_units.items():
+        clone = dict(item)
+        clone["review_source"] = source_name
+        clone["review_source_provenance"] = sorted(set(provenance[unit_id]))
+        clone["review_themes"] = sorted(_review_pack_themes(clone))
+        clone["must_disposition"] = True
+        sources.append(clone)
+
+    packs = []
+    pack_index = {}
+    member_pack = {}
+    pack_limits = {"normal": 6, "light": 6}
+
+    def add_pack(key, item):
+        unit_id = item.get("id")
+        if not unit_id:
+            return False
+        if unit_id in member_pack:
+            raise RuntimeError(
+                f"V6.2 invariant violation: unit {unit_id} already assigned to {member_pack[unit_id]}"
+            )
+        if key not in pack_index:
+            pack_index[key] = len(packs)
+            packs.append({
+                "pack_id": f"SRP-{len(packs)+1:03d}",
+                "theme": key,
+                "review_effort": item.get("review_effort", "light"),
+                "must_disposition": True,
+                "members": [],
+                "member_count": 0,
+                "purpose": "context batching only; not a finding or safety verdict",
+            })
+        pack = packs[pack_index[key]]
+        pack["members"].append({
+            "id": unit_id,
+            "source": item.get("review_source"),
+            "function": item.get("function"),
+            "review_effort": item.get("review_effort"),
+            "priority_score": item.get("priority_score"),
+            "must_disposition": True,
+        })
+        pack["member_count"] = len(pack["members"])
+        pack["review_effort"] = _review_pack_effort([
+            {"review_effort": x["review_effort"]} for x in pack["members"]
+        ])
+        member_pack[unit_id] = pack["pack_id"]
+        return True
+
+    def canonical_theme(themes):
+        themes = set(themes or ["other_security_logic"])
+        for preferred in SECURITY_REVIEW_PACK_ORDER:
+            if preferred in themes:
+                return preferred
+        return sorted(themes)[0]
+
+    def add_bounded_primary(theme, effort, item):
+        base = f"primary::{theme}::{effort}"
+        limit = pack_limits.get(effort, 6)
+        key = base
+        if key in pack_index and len(packs[pack_index[key]]["members"]) >= limit:
+            suffix = 2
+            while f"{base}::{suffix}" in pack_index:
+                suffix += 1
+            key = f"{base}::{suffix}"
+        add_pack(key, item)
+
+    for item in sources:
+        themes = item.get("review_themes") or ["other_security_logic"]
+        source = item.get("review_source")
+        effort = item.get("review_effort", "light")
+        theme = canonical_theme(themes)
+
+        # Fallback hypotheses must never silently merge into a primary pack.
+        # A multi-theme fallback gets exactly one canonical fallback boundary.
+        if source == "v6.1_fallback":
+            add_pack(f"fallback::{theme}", item)
+            continue
+
+        # Deep items are isolated by source+id to preserve maximum recall.
+        if effort == "deep":
+            add_pack(f"deep::{source}::{item.get('id')}", item)
+            continue
+
+        # Normal/light items are separated and bounded. This saves context
+        # without allowing a large mixed pack to become a review bottleneck.
+        add_bounded_primary(theme, effort, item)
+
+    for pack in packs:
+        pack["members"].sort(
+            key=lambda x: (-(x.get("priority_score") or 0), x.get("id") or "")
+        )
+
+    raw_ids = [x.get("id") for x in sources if x.get("id")]
+    packed_ids = [m.get("id") for p in packs for m in p.get("members", [])]
+    if len(packed_ids) != len(set(packed_ids)):
+        raise RuntimeError("V6.2 invariant violation: duplicate unit membership")
+    if set(packed_ids) != set(raw_ids):
+        raise RuntimeError("V6.2 invariant violation: raw unit missing from packs")
+
+    return {
+        "schema_version": "6.2",
+        "policy": {
+            "no_unit_discard": True,
+            "member_level_disposition_required": True,
+            "grouping_is_context_batching_only": True,
+            "fallback_cannot_merge_into_primary": True,
+            "deep_units_isolated": True,
+            "unknown_is_not_safe": True,
+            "unique_unit_membership": True,
+            "normal_light_separated": True,
+            "max_primary_pack_members": 6,
+        },
+        "raw_unit_count": len(sources),
+        "pack_count": len(packs),
+        "packs": packs,
+        "all_units": sources,
+    }
+
+
 # OUTPUT
 # ============================================================
 
@@ -8005,6 +8328,24 @@ def main():
         ]
     )
 
+    v61_fallback_index = v61_coverage.get(
+        "orphan_fallback_hypotheses",
+        [],
+    )
+
+    # ------------------------------------------------------------
+    # V6.2 Semantic review packs
+    # ------------------------------------------------------------
+
+    print("[*] Building V6.2 semantic review packs...")
+
+    semantic_review_plan = build_semantic_review_packs_v62(
+        v5_review_index,
+        v6_review_index,
+        v61_orphan_review_index,
+        v61_fallback_index,
+    )
+
     v5_output_dir = (
         Path("/opt/codex-security/wpsec-output")
         / plugin_root.name
@@ -8077,6 +8418,13 @@ def main():
 
         "review_effort":
             effort_counts,
+
+        "coverage_policy": {
+            "all_review_units_must_be_dispositioned": True,
+            "high_impact_low_privilege_floor": "deep",
+            "unknown_flow_is_not_safe": True,
+            "priority_is_not_a_suppression_boundary": True,
+        },
 
         "resolver_stats":
             resolver_stats,
@@ -8203,6 +8551,11 @@ def main():
         exist_ok=True
     )
 
+    write_json(
+        v61_output_dir / "semantic-review-plan.json",
+        semantic_review_plan,
+    )
+
     v61_summary = {
         "schema_version": "6.1",
 
@@ -8213,6 +8566,12 @@ def main():
             len(
                 v61_orphan_review_index
             ),
+
+        "semantic_review_packs":
+            semantic_review_plan["pack_count"],
+
+        "semantic_review_raw_units":
+            semantic_review_plan["raw_unit_count"],
 
         "cross_state_dependencies":
             len(

@@ -490,10 +490,41 @@ Do not equate security coverage with reading every PHP file.
 Do not launch a generic repository-wide baseline audit merely to achieve
 file coverage.
 
-### Review effort
+### Recall-first review policy
 
-`review_effort` is model-work prioritization only. It is NOT severity
-and MUST NOT be used to suppress a unit.
+The primary optimization objective is **finding vulnerabilities without
+silent coverage loss**. Token reduction is secondary.
+
+The mapper may prioritize and deduplicate semantic work, but it MUST NOT
+remove a security-relevant path merely because its deterministic score is
+low, its flow is unknown, or its sink family is not yet understood.
+
+Mandatory deep-review floor:
+
+- unauthenticated/public or permission-uncertain paths touching a high-impact
+  effect;
+- subscriber/contributor paths touching a high-impact effect;
+- unknown dataflow that reaches or may reach code execution, dynamic include,
+  deserialization, SQL, file write/upload/read/delete, configuration/option
+  mutation, role/capability/session mutation, or sensitive-secret access;
+- authentication, account recovery, ownership, verification, or privilege
+  transitions that can plausibly produce account takeover or privilege
+  escalation.
+
+`review_effort` is model-work prioritization only. It is NOT severity and
+MUST NOT be used to suppress a unit. `must_review=true` means the unit must
+receive a disposition before the scan can be considered complete.
+
+### Semantic deduplication
+
+V5, V6, and V6.1 may describe the same underlying attack path. To reduce
+repeated model reasoning, the reviewer MAY validate one concrete source-backed
+path once and attach the resulting disposition to all equivalent units.
+
+Deduplication is valid only when the units share the same concrete security
+boundary, attacker-controlled state, target object/state, and security effect.
+If any of those differ, review them separately. Never deduplicate merely
+because function names or sink categories match.
 
 For `deep` units:
 
@@ -518,7 +549,9 @@ For `bounded` or flow-`unknown` units:
   relevant locations, and necessary helper edges;
 - never interpret `unknown` as safe;
 - escalate the unit to normal or deep review if a plausible attack path
-  appears.
+  appears;
+- if the unit has a high-impact effect and public/low-privilege or
+  permission-uncertain exposure, apply the mandatory deep-review floor.
 
 ### Per-unit source boundary
 
@@ -633,6 +666,21 @@ Preserve the original Codex Security strengths during semantic review:
 
 Do not reduce semantic validation quality merely because deterministic
 discovery reduced the amount of source that requires model review.
+
+### Recall-first completion check
+
+Before finalizing, explicitly verify that the scan did not lose coverage at
+any deterministic boundary:
+
+- high-impact sinks added by the mapper are represented in a review queue or
+  explicit unresolved/gap queue;
+- public/low-privilege high-impact units were not downgraded below the deep
+  review floor;
+- unknown flow was not treated as safe;
+- duplicate V5/V6/V6.1 descriptions were linked to one validated concrete
+  path rather than silently dropped;
+- dynamic callbacks, dispatch, inheritance, and unresolved dataflow remain
+  explicit gaps when they cannot be resolved statically.
 
 ### Completion
 
