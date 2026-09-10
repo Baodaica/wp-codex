@@ -4,11 +4,13 @@ import { tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { promisify } from "node:util";
 import { z } from "incur";
+import type { ScanAuthMode } from "./api.js";
 import type { CodexSecurityConfig } from "./config.js";
 import {
   runReadOnlyCodex,
   type ReadOnlyCodexOptions,
 } from "./scan-comparison.js";
+import { CODEX_SECURITY_THREAD_SOURCES } from "./thread-source.js";
 import {
   enclosingGitWorktreeRoot,
   normalizeRepository,
@@ -39,6 +41,8 @@ export interface ComponentPlan {
 }
 
 export interface ComponentPlanningOptions {
+  /** @internal Authentication already selected by the calling scan. */
+  auth?: ScanAuthMode;
   config?: CodexSecurityConfig;
   environment?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
@@ -88,7 +92,10 @@ export async function planComponents(
     ].join("\n"),
     z.toJSONSchema(componentPlanSchema, { target: "openapi-3.0" }),
     { ...options, config: options.config ?? {}, workingDirectory: tmpdir() },
-    { surface: "cli" },
+    {
+      surface: "cli",
+      threadSource: CODEX_SECURITY_THREAD_SOURCES.scan,
+    },
   );
   const plan = await normalizeComponentPlan(
     repository,
@@ -189,9 +196,11 @@ async function inventoryFiles(
           throw error;
         },
       );
-      if (metadata?.isFile()) files.push(path);
+      if (metadata?.isFile()) files.push(join(repository, path));
     }
-    return files.sort();
+    return files.length === 0
+      ? []
+      : [...(await normalizeTarget(repository, files, signal)).paths].sort();
   }
   const files: string[] = [];
   const pending = [""];

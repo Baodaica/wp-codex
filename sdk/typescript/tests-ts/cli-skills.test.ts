@@ -68,6 +68,9 @@ describe("CLI skill commands", () => {
                 invocation = args;
                 prompt = output?.appServer?.prompt ?? input ?? "";
                 expect(input).toBe(command === "patch" ? undefined : prompt);
+                expect(output?.appServer?.threadSource).toBe(
+                  command === "patch" ? "security_remediation" : undefined,
+                );
                 return status;
               },
             }),
@@ -76,7 +79,12 @@ describe("CLI skill commands", () => {
         expect(invocation).toEqual([
           ...(command === "patch"
             ? ["app-server"]
-            : ["exec", "--ignore-user-config"]),
+            : [
+                "exec",
+                "--ignore-user-config",
+                "--thread-source",
+                "security_validation",
+              ]),
           "--disable",
           "plugins",
           ...(command === "patch"
@@ -132,6 +140,7 @@ describe("CLI skill commands", () => {
         expect(help.text()).toContain("--codex <array>");
         expect(help.text()).toContain('model="gpt-5.6-terra"');
         expect(help.text()).toContain('model_reasoning_effort="high"');
+        expect(help.text()).toContain("analytics.enabled=false");
         expect(help.text()).not.toContain("--provider");
       }
     } finally {
@@ -829,6 +838,89 @@ describe("CLI skill commands", () => {
     }
   });
 
+  test.each(["validate", "patch", "verify-fix"] as const)(
+    "passes explicit analytics settings to %s",
+    async (command) => {
+      for (const override of [
+        "analytics.enabled=false",
+        "analytics.enabled=true",
+        "analytics={enabled=false}",
+      ]) {
+        let invocation: readonly string[] = [];
+        const stderr = capture();
+        expect(
+          await main(
+            [
+              command,
+              "Synthetic finding",
+              "--effort",
+              "high",
+              "--codex",
+              override,
+            ],
+            capture().stream,
+            stderr.stream,
+            dependencies({
+              onCodex: (args, output) => {
+                invocation = args;
+                if (command === "verify-fix") {
+                  output?.stdout.write(
+                    JSON.stringify({
+                      results: [
+                        {
+                          id: "finding-1",
+                          status: "fixed",
+                          evidence: "The original issue no longer reproduces.",
+                        },
+                      ],
+                    }),
+                  );
+                }
+                return 0;
+              },
+            }),
+          ),
+          stderr.text(),
+        ).toBe(0);
+        expect(invocation).toContain(override);
+        expect(invocation).toContain('model_reasoning_effort="high"');
+      }
+
+      for (const override of [
+        'model_provider="synthetic"',
+        "features.goals=false",
+        "analytics.unrelated=false",
+        "analytics.enabled=false",
+      ]) {
+        let started = false;
+        const stderr = capture();
+        expect(
+          await main(
+            [
+              command,
+              "Synthetic finding",
+              "--codex",
+              override,
+              ...(override === "analytics.enabled=false"
+                ? ["--codex", "analytics.enabled=true"]
+                : []),
+            ],
+            capture().stream,
+            stderr.stream,
+            dependencies({
+              onCodex: () => {
+                started = true;
+                return 0;
+              },
+            }),
+          ),
+        ).toBe(2);
+        expect(stderr.text()).toContain("codex-security:");
+        expect(started).toBe(false);
+      }
+    },
+  );
+
   test("selects reasoning effort directly for validation and patching", async () => {
     for (const command of ["validate", "patch"] as const) {
       let invocation: readonly string[] = [];
@@ -987,6 +1079,46 @@ describe("CLI skill commands", () => {
     ).resolves.toBe(0);
     expect(stdout.text()).toBe(`${input}\n`);
     expect(stderr.text()).toBe("");
+  });
+
+  test("preserves the selected Codex home from copied Windows environments", async () => {
+    const configuredHome = "./synthetic home with spaces";
+    const source = `
+process.stdout.write(JSON.stringify({
+  type: "item.completed",
+  item: {
+    type: "agent_message",
+    text: JSON.stringify({
+      home: process.env.CODEX_HOME ?? null,
+      homeKeys: Object.keys(process.env).filter((name) => name.toUpperCase() === "CODEX_HOME"),
+      other: process.env.SYNTHETIC_OTHER,
+    }),
+  },
+}) + "\\n");
+`;
+    for (const name of ["CODEX_HOME", "codex_home", "Codex_Home"]) {
+      const environment = Object.freeze({
+        [name]: configuredHome,
+        SYNTHETIC_OTHER: "preserved",
+      });
+      const stdout = capture();
+      const stderr = capture();
+      expect(
+        await runCodexSkillCommand(
+          ["-e", source],
+          { command: "validate", stdout: stdout.stream, stderr: stderr.stream },
+          { command: process.execPath },
+          environment,
+        ),
+      ).toBe(0);
+      const selected = process.platform === "win32" || name === "CODEX_HOME";
+      expect(JSON.parse(stdout.text())).toEqual({
+        home: selected ? resolve(configuredHome) : null,
+        homeKeys: selected ? ["CODEX_HOME"] : [],
+        other: "preserved",
+      });
+      expect(stderr.text()).toBe("");
+    }
   });
 
   test("extracts the final skill response without exposing intermediate events", async () => {
@@ -1180,7 +1312,7 @@ lines.on("line", (line) => {
     send({ id: 1, result: {} });
   } else if (request.method === "thread/start") {
     assert.equal(process.cwd(), ${JSON.stringify(process.cwd())});
-    assert.deepEqual(request.params, { approvalPolicy: "never", sandbox: "workspace-write" });
+    assert.deepEqual(request.params, { threadSource: "security_remediation", approvalPolicy: "never", sandbox: "workspace-write" });
     send({ id: 2, result: { thread: { id: "parent", source: "vscode", ephemeral: false } } });
   } else if (request.method === "turn/start") {
     assert.equal(request.params.threadId, "parent");
@@ -1213,6 +1345,7 @@ lines.on("line", (line) => {
           appServer: {
             directory: process.cwd(),
             prompt: "Fix the synthetic finding",
+            threadSource: "security_remediation",
           },
         },
         { command: process.execPath },
@@ -1242,6 +1375,7 @@ lines.on("line", (line) => {
   }
   if (request.method === "thread/start") {
     assert.deepEqual(request.params, {
+      threadSource: "security_validation",
       approvalPolicy: "on-request",
       sandbox: "read-only",
       config: { mcp_servers: { repository: { enabled: false } } },
@@ -1287,6 +1421,7 @@ lines.on("line", (line) => {
             directory: process.cwd(),
             prompt:
               "Verify the synthetic finding without editing the repository",
+            threadSource: "security_validation",
             sandbox: "read-only",
             onEvent: (event) => activity.push(event),
           },
@@ -1357,6 +1492,7 @@ lines.on("line", (line) => {
           appServer: {
             directory: process.cwd(),
             prompt: "Synthetic finding",
+            threadSource: "security_remediation",
           },
         },
         { command: process.execPath },
@@ -1389,6 +1525,7 @@ lines.on("line", (line) => {
           appServer: {
             directory: process.cwd(),
             prompt: "Fix the synthetic finding",
+            threadSource: "security_remediation",
           },
         },
         { command: process.execPath },
