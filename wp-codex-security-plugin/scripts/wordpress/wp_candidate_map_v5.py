@@ -1633,6 +1633,10 @@ SINK_TO_EFFECTS = {
         "code_execution",
     ],
 
+    "dynamic_invocation": [
+        "code_execution",
+    ],
+
     "deserialization": [
         "deserialization",
     ],
@@ -5758,7 +5762,6 @@ HIGH_IMPACT_V5_EFFECTS = {
     "code_execution",
     "dynamic_include",
     "deserialization",
-    "dynamic_invocation",
     "configuration_write",
     "database_write",
     "file_write",
@@ -5783,9 +5786,6 @@ def v5_access_is_low_privilege(unit):
         "public",
         "unknown_permission_callback",
         "permission_callback_requires_analysis",
-        "subscriber",
-        "contributor",
-        "author",
     } or "nopriv" in hook or surface == "known_public"
 
 
@@ -6137,6 +6137,47 @@ V6_OBJECT_PATTERNS = {
     ],
 }
 
+# Custom-role scope classification.
+#
+# Only Subscriber/Contributor-equivalent capability profiles are
+# eligible for the requested low-privilege scope.
+#
+# Author is intentionally NOT a low-privilege baseline.
+V6_LOW_PRIVILEGE_ROLE_CAPABILITIES = {
+    "subscriber": {
+        "read",
+    },
+    "contributor": {
+        "read",
+        "edit_posts",
+    },
+}
+
+# Capabilities that clearly place a custom role above the requested
+# low-privilege scope.
+V6_ELEVATED_ROLE_CAPABILITIES = {
+    "manage_options",
+    "activate_plugins",
+    "install_plugins",
+    "update_plugins",
+    "delete_plugins",
+    "edit_plugins",
+    "edit_themes",
+    "switch_themes",
+    "edit_users",
+    "create_users",
+    "delete_users",
+    "promote_users",
+    "manage_categories",
+    "publish_posts",
+    "publish_pages",
+    "edit_pages",
+    "delete_pages",
+    "delete_published_posts",
+    "delete_published_pages",
+    "unfiltered_html",
+}
+
 V6_SECURITY_META_HINTS = [
     "role",
     "capabil",
@@ -6160,6 +6201,180 @@ V6_SECURITY_META_HINTS = [
     "secret",
     "registration",
 ]
+
+
+def _v6_extract_static_role_capabilities(text):
+    """
+    Extract capabilities only when an add_role() declaration contains
+    a statically visible capability array.
+
+    Dynamic capability expressions are deliberately classified as
+    unknown rather than guessed.
+    """
+    if not text:
+        return [], False
+
+    if not re.search(
+        r"\badd_role\s*\(",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return [], False
+
+    capabilities = set()
+
+    # Support common WordPress forms:
+    #
+    # add_role('role', array(
+    #     'read' => true,
+    #     'edit_posts' => true,
+    # ));
+    #
+    # and:
+    #
+    # add_role('role', [
+    #     'read' => true,
+    # ]);
+    role_call_re = re.compile(
+        r"""
+        \badd_role\s*\(
+        \s*['"][A-Za-z0-9_-]+['"]
+        \s*,
+        \s*
+        (?P<array>
+            array\s*\((?P<array_body>.*?)
+            \)
+            |
+            \[(?P<bracket_body>.*?)
+            \]
+        )
+        """,
+        flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
+    )
+
+    matched_static = False
+
+    for match in role_call_re.finditer(text):
+        matched_static = True
+
+        body = (
+            match.group("array_body")
+            if match.group("array_body") is not None
+            else match.group("bracket_body")
+        )
+
+        for cap_match in re.finditer(
+            r"""['"]([A-Za-z0-9_-]+)['"]\s*=>\s*(?:true|1)\b""",
+            body,
+            flags=re.IGNORECASE,
+        ):
+            capabilities.add(
+                cap_match.group(1).lower()
+            )
+
+    if not matched_static:
+        return [], True
+
+    if not capabilities:
+        return [], True
+
+    return sorted(capabilities), False
+
+
+def _v6_classify_custom_role_capabilities(text):
+    """
+    Classify a statically visible custom role against the requested
+    low-privilege scope.
+
+    Author is intentionally never treated as a low-privilege baseline.
+
+    Returns:
+        profile:
+            none
+            subscriber_like
+            contributor_like
+            higher_privilege
+            unknown
+
+        low_privilege_scope:
+            True  = in requested low-privilege scope
+            False = clearly above requested scope
+            None  = unresolved / do not promote
+    """
+    capabilities, unknown = (
+        _v6_extract_static_role_capabilities(text)
+    )
+
+    if not capabilities and not unknown:
+        return {
+            "profile": "none",
+            "capabilities": [],
+            "low_privilege_scope": None,
+            "reason": None,
+        }
+
+    if unknown:
+        return {
+            "profile": "unknown",
+            "capabilities": [],
+            "low_privilege_scope": None,
+            "reason": "custom_role_capabilities_unresolved",
+        }
+
+    caps = set(capabilities)
+
+    elevated = sorted(
+        caps & V6_ELEVATED_ROLE_CAPABILITIES
+    )
+
+    # Elevated capability always wins. This prevents a role such as
+    # read + edit_posts + manage_options from being treated as
+    # Contributor-like.
+    if elevated:
+        return {
+            "profile": "higher_privilege",
+            "capabilities": capabilities,
+            "low_privilege_scope": False,
+            "reason": "custom_role_contains_elevated_capability",
+            "elevated_capabilities": elevated,
+        }
+
+    subscriber = V6_LOW_PRIVILEGE_ROLE_CAPABILITIES[
+        "subscriber"
+    ]
+    contributor = V6_LOW_PRIVILEGE_ROLE_CAPABILITIES[
+        "contributor"
+    ]
+
+    if (
+        "edit_posts" in caps
+        and caps.issubset(contributor)
+    ):
+        return {
+            "profile": "contributor_like",
+            "capabilities": capabilities,
+            "low_privilege_scope": True,
+            "reason": "custom_role_is_contributor_like",
+        }
+
+    if caps.issubset(subscriber):
+        return {
+            "profile": "subscriber_like",
+            "capabilities": capabilities,
+            "low_privilege_scope": True,
+            "reason": "custom_role_is_subscriber_like",
+        }
+
+    # Unknown custom capabilities are not assumed to be low privilege.
+    return {
+        "profile": "unknown",
+        "capabilities": capabilities,
+        "low_privilege_scope": None,
+        "reason": (
+            "custom_role_capability_profile_not_equivalent_to_"
+            "low_privilege_baseline"
+        ),
+    }
 
 
 def _v6_text(obj):
@@ -6318,6 +6533,17 @@ def build_security_state_graph_v6(
             for x in identity
         )
 
+        custom_role_profile = (
+            _v6_classify_custom_role_capabilities(text)
+            if role_transition
+            else {
+                "profile": "none",
+                "capabilities": [],
+                "low_privilege_scope": None,
+                "reason": None,
+            }
+        )
+
         password_transition = any(
             x["category"] == "password_transition"
             for x in identity
@@ -6379,6 +6605,16 @@ def build_security_state_graph_v6(
                 "role_or_capability_transition"
             )
 
+            if custom_role_profile["profile"] == "higher_privilege":
+                risk_reasons.append(
+                    "custom_role_higher_privilege_than_low_scope"
+                )
+
+            elif custom_role_profile["profile"] == "unknown":
+                risk_reasons.append(
+                    "custom_role_privilege_requires_analysis"
+                )
+
         if password_transition:
             risk_reasons.append(
                 "password_or_reset_transition"
@@ -6430,7 +6666,14 @@ def build_security_state_graph_v6(
             required_reasoning.extend([
                 "determine reachable resulting role/capabilities",
                 "check subscriber-to-admin or equivalent privilege chain",
+                "compare custom role capabilities against subscriber and contributor baselines",
+                "do not treat author as low privilege scope",
             ])
+
+            if custom_role_profile["profile"] == "unknown":
+                required_reasoning.append(
+                    "resolve dynamic or unknown custom role capabilities before scope classification"
+                )
 
         if configuration_write:
             required_reasoning.extend([
@@ -6447,6 +6690,7 @@ def build_security_state_graph_v6(
             "request_reachable": request_reachable,
             "registrations": registrations_for_function,
             "identity_transitions": identity,
+            "custom_role_profile": custom_role_profile,
             "configuration_transitions": config,
             "token_operations": tokens,
             "authorization_controls": authorization,
@@ -7907,7 +8151,7 @@ SECURITY_REVIEW_PACK_ORDER = [
     "configuration_lifecycle",
     "operational_state",
     "secret_verification",
-        "other_security_logic",
+    "other_security_logic",
 ]
 
 
@@ -7916,62 +8160,45 @@ def _review_pack_text(obj):
 
 
 def _review_pack_themes(unit):
-    """Return conservative semantic themes for batching only.
-
-    Themes are derived from generic security effects, reasons, hints, and
-    security-related text. Do not key batching on a particular plugin's
-    function/class names or business workflow.
-    """
-    text = _review_pack_text(unit).lower()
+    """Return conservative semantic themes for batching only."""
+    text = _review_pack_text(unit)
     themes = set()
 
     effects = set(unit.get("effects", [])) if isinstance(unit, dict) else set()
     reasons = set(unit.get("risk_reasons", [])) if isinstance(unit, dict) else set()
     hints = set(unit.get("security_meta_hints", [])) if isinstance(unit, dict) else set()
     hints |= set(unit.get("security_name_hints", [])) if isinstance(unit, dict) else set()
-    hints = {str(x).lower() for x in hints}
 
     if effects & {
         "file_read", "file_write", "file_upload", "file_delete",
-        "dynamic_include", "code_execution", "dynamic_invocation",
+        "dynamic_include", "code_execution", "secret_read",
     }:
-        themes.add("filesystem_code_execution")
+        themes.add("public_filesystem_execution")
 
-    if "configuration_write" in effects or any(x in text for x in (
-        "configuration", "option", "setting", "config",
-    )):
-        themes.add("configuration_mutation")
+    if "configuration_write" in effects or "configuration" in text:
+        themes.add("public_configuration_mutation")
 
     if any(x in reasons for x in {
         "role_or_capability_transition",
         "password_or_reset_transition",
         "authentication_state_transition",
     }) or any(x in text for x in (
-        "authorization", "capability", "password", "reset",
-        "authentication", "current_user_can", "user_can",
+        "authorization", "capability", "password", "reset", "auth",
+        "current_user_can", "user_can",
     )):
         themes.add("identity_auth_authorization")
 
     if "user_security_state_mutation" in reasons or any(x in text for x in (
-        "usermeta", "user_meta", "ownership", "target identity",
-        "account state", "user state",
+        "usermeta", "user_meta", "user state", "ownership", "target identity",
     )):
         themes.add("user_state_mutation")
 
-    if any(x in reasons for x in {
-        "state_transition", "security_sensitive_state_change",
-        "configuration_lifecycle",
-    }) or any(x in text for x in (
-        "state transition", "state change", "lifecycle",
-    )):
-        themes.add("security_state_transition")
 
-    if any(x in hints for x in {
-        "secret", "token", "credential", "verification", "verify",
-    }) or any(x in text for x in (
-        "secret", "token", "credential", "verification",
-    )):
+    if any(x in hints for x in {"token", "secret", "verify", "verification"}) or any(
+        x in text for x in ("token", "secret", "credential", "verification", "verify")
+    ):
         themes.add("secret_verification")
+
 
     if not themes:
         themes.add("other_security_logic")
@@ -7991,27 +8218,12 @@ def build_semantic_review_packs_v62(v5_review_index, v6_review_index, v61_orphan
 
     Safety invariants:
       - no unit is discarded;
-      - every raw unit id appears in exactly one pack;
       - no unit is declared safe by grouping;
       - disposition remains member-level;
       - fallback remains separate and can be promoted;
-      - deep units remain isolated;
-      - normal/light primary packs are separated and bounded;
       - a pack's effort is the maximum member effort.
     """
-    # The same logical unit can be emitted by multiple V6.1 queues. Build a
-    # canonical representation instead of allowing queue overlap to become
-    # duplicate model-facing memberships. Fallback wins over orphan because
-    # it is the stronger coverage classification for the same logical unit.
-    source_priority = {
-        "v5": 1,
-        "v6": 2,
-        "v6.1_orphan": 3,
-        "v6.1_fallback": 4,
-    }
-    canonical_units = {}
-    provenance = defaultdict(list)
-
+    sources = []
     for source_name, items in (
         ("v5", v5_review_index),
         ("v6", v6_review_index),
@@ -8019,36 +8231,19 @@ def build_semantic_review_packs_v62(v5_review_index, v6_review_index, v61_orphan
         ("v6.1_fallback", v61_fallback_index),
     ):
         for item in items or []:
-            unit_id = item.get("id")
-            if not unit_id:
-                continue
-            provenance[unit_id].append(source_name)
-            current = canonical_units.get(unit_id)
-            if current is None or source_priority[source_name] > source_priority[current[0]]:
-                canonical_units[unit_id] = (source_name, item)
+            clone = dict(item)
+            clone["review_source"] = source_name
+            clone["review_themes"] = sorted(_review_pack_themes(clone))
+            clone["must_disposition"] = True
+            sources.append(clone)
 
-    sources = []
-    for unit_id, (source_name, item) in canonical_units.items():
-        clone = dict(item)
-        clone["review_source"] = source_name
-        clone["review_source_provenance"] = sorted(set(provenance[unit_id]))
-        clone["review_themes"] = sorted(_review_pack_themes(clone))
-        clone["must_disposition"] = True
-        sources.append(clone)
-
+    # Deep/high-impact units are isolated unless they share an explicit
+    # security theme AND both are already model-facing primary units.
+    # This avoids accidentally merging unrelated attack surfaces.
     packs = []
     pack_index = {}
-    member_pack = {}
-    pack_limits = {"normal": 6, "light": 6}
 
     def add_pack(key, item):
-        unit_id = item.get("id")
-        if not unit_id:
-            return False
-        if unit_id in member_pack:
-            raise RuntimeError(
-                f"V6.2 invariant violation: unit {unit_id} already assigned to {member_pack[unit_id]}"
-            )
         if key not in pack_index:
             pack_index[key] = len(packs)
             packs.append({
@@ -8062,7 +8257,7 @@ def build_semantic_review_packs_v62(v5_review_index, v6_review_index, v61_orphan
             })
         pack = packs[pack_index[key]]
         pack["members"].append({
-            "id": unit_id,
+            "id": item.get("id"),
             "source": item.get("review_source"),
             "function": item.get("function"),
             "review_effort": item.get("review_effort"),
@@ -8073,36 +8268,15 @@ def build_semantic_review_packs_v62(v5_review_index, v6_review_index, v61_orphan
         pack["review_effort"] = _review_pack_effort([
             {"review_effort": x["review_effort"]} for x in pack["members"]
         ])
-        member_pack[unit_id] = pack["pack_id"]
-        return True
-
-    def canonical_theme(themes):
-        themes = set(themes or ["other_security_logic"])
-        for preferred in SECURITY_REVIEW_PACK_ORDER:
-            if preferred in themes:
-                return preferred
-        return sorted(themes)[0]
-
-    def add_bounded_primary(theme, effort, item):
-        base = f"primary::{theme}::{effort}"
-        limit = pack_limits.get(effort, 6)
-        key = base
-        if key in pack_index and len(packs[pack_index[key]]["members"]) >= limit:
-            suffix = 2
-            while f"{base}::{suffix}" in pack_index:
-                suffix += 1
-            key = f"{base}::{suffix}"
-        add_pack(key, item)
 
     for item in sources:
         themes = item.get("review_themes") or ["other_security_logic"]
         source = item.get("review_source")
         effort = item.get("review_effort", "light")
-        theme = canonical_theme(themes)
 
         # Fallback hypotheses must never silently merge into a primary pack.
-        # A multi-theme fallback gets exactly one canonical fallback boundary.
         if source == "v6.1_fallback":
+            theme = sorted(themes)[0]
             add_pack(f"fallback::{theme}", item)
             continue
 
@@ -8111,21 +8285,14 @@ def build_semantic_review_packs_v62(v5_review_index, v6_review_index, v61_orphan
             add_pack(f"deep::{source}::{item.get('id')}", item)
             continue
 
-        # Normal/light items are separated and bounded. This saves context
-        # without allowing a large mixed pack to become a review bottleneck.
-        add_bounded_primary(theme, effort, item)
+        # Normal/light items can share a theme across V5/V6/V6.1. This is
+        # the main token-saving mechanism, while member-level disposition
+        # prevents grouping from becoming a suppression boundary.
+        theme = sorted(themes)[0]
+        add_pack(f"primary::{theme}", item)
 
     for pack in packs:
-        pack["members"].sort(
-            key=lambda x: (-(x.get("priority_score") or 0), x.get("id") or "")
-        )
-
-    raw_ids = [x.get("id") for x in sources if x.get("id")]
-    packed_ids = [m.get("id") for p in packs for m in p.get("members", [])]
-    if len(packed_ids) != len(set(packed_ids)):
-        raise RuntimeError("V6.2 invariant violation: duplicate unit membership")
-    if set(packed_ids) != set(raw_ids):
-        raise RuntimeError("V6.2 invariant violation: raw unit missing from packs")
+        pack["members"].sort(key=lambda x: (-(x.get("priority_score") or 0), x.get("id") or ""))
 
     return {
         "schema_version": "6.2",
@@ -8136,14 +8303,507 @@ def build_semantic_review_packs_v62(v5_review_index, v6_review_index, v61_orphan
             "fallback_cannot_merge_into_primary": True,
             "deep_units_isolated": True,
             "unknown_is_not_safe": True,
-            "unique_unit_membership": True,
-            "normal_light_separated": True,
-            "max_primary_pack_members": 6,
         },
         "raw_unit_count": len(sources),
         "pack_count": len(packs),
         "packs": packs,
         "all_units": sources,
+    }
+
+
+# ============================================================
+# V6.3 ADAPTIVE SECURITY INVESTIGATION
+#
+# This layer does not attempt to prove vulnerabilities deterministically.
+# It creates compact, source-backed investigation cases that allow the
+# semantic reviewer to generate and expand attack hypotheses adaptively.
+# V5/V6/V6.1 remain the discovery and coverage layers.
+# ============================================================
+
+V63_HIGH_IMPACT_EFFECTS = {
+    "code_execution",
+    "dynamic_include",
+    "deserialization",
+    "sql_query",
+    "database_write",
+    "file_read",
+    "file_write",
+    "file_upload",
+    "file_delete",
+    "configuration_write",
+    "role_change",
+    "capability_change",
+    "session_change",
+    "object_update",
+    "object_delete",
+    "secret_read",
+}
+
+V63_SECURITY_THEMES = {
+    "filesystem": {
+        "file_read", "file_write", "file_upload", "file_delete",
+        "dynamic_include", "code_execution",
+    },
+    "injection": {"sql_query", "code_execution", "dynamic_include", "deserialization"},
+    "configuration": {"configuration_write"},
+    "identity": {"role_change", "capability_change", "session_change"},
+    "object_authorization": {"object_update", "object_delete"},
+    "secrets": {"secret_read"},
+}
+
+
+def _v63_effects(obj):
+    if not isinstance(obj, dict):
+        return set()
+    return set(obj.get("effects", []) or [])
+
+
+def _v63_text(obj):
+    return _review_pack_text(obj) if isinstance(obj, dict) else ""
+
+
+def _v63_themes(obj):
+    """Return conservative semantic themes for adaptive investigation."""
+    effects = _v63_effects(obj)
+    themes = {
+        name for name, members in V63_SECURITY_THEMES.items()
+        if effects & members
+    }
+
+    text = _v63_text(obj).lower()
+    reasons = set(obj.get("risk_reasons", []) or []) if isinstance(obj, dict) else set()
+
+    # Preserve the existing broad identity signal for authentication,
+    # roles, capabilities, sessions, and related security concepts.
+    if any(x in text for x in (
+        "authorization",
+        "capability",
+        "ownership",
+        "permission",
+        "auth",
+    )):
+        themes.add("identity")
+
+    if any(x in text for x in (
+        "user",
+        "role",
+        "account",
+        "password",
+        "reset",
+        "session",
+    )):
+        themes.add("identity")
+
+    if any(x in reasons for x in (
+        "role_or_capability_transition",
+        "password_or_reset_transition",
+        "authentication_state_transition",
+    )):
+        themes.add("identity")
+
+    # Generic semantic security signals emitted by V6/V6.1.
+    if "request_reachable_without_obvious_capability_check" in reasons:
+        themes.add("authorization")
+
+    if "ownership_or_target_identity_requires_analysis" in reasons:
+        themes.add("ownership")
+
+    if "user_security_state_mutation" in reasons:
+        themes.add("state_transition")
+
+    if "security_relevant_configuration_transition" in reasons:
+        themes.add("configuration")
+
+    if any(x in reasons for x in (
+        "security_sensitive_code_outside_primary_v5_v6_queue",
+        "custom_security_abstraction_requires_analysis",
+    )):
+        themes.add("security_abstraction")
+
+    if "state_transition" in reasons or "security_sensitive_state_change" in reasons:
+        themes.add("configuration")
+
+    # V6.1 cross-state records represent a concrete producer/consumer
+    # relationship even when no direct effect is attached.
+    if isinstance(obj, dict) and (
+        obj.get("producer") or obj.get("consumer")
+    ) and (
+        obj.get("state") or obj.get("shared_semantic_hints")
+    ):
+        themes.add("cross_request_state")
+
+    return themes or {"other"}
+
+
+def _v63_role_signal(obj):
+    text = _v63_text(obj).lower()
+    if any(x in text for x in ("unauthenticated", "nopriv", "public", "known_public")):
+        return "unauthenticated_or_public"
+    if "subscriber" in text:
+        return "subscriber"
+    if "contributor" in text:
+        return "contributor"
+    if "author" in text:
+        return "author"
+    return "unknown_or_authenticated"
+
+
+def _v63_case_key(obj):
+    if not isinstance(obj, dict):
+        return None
+    # Prefer concrete source anchors. IDs from different graph generations
+    # are intentionally not used as the sole deduplication key.
+    producer = str(obj.get("producer") or "")
+    consumer = str(obj.get("consumer") or "")
+    function = str(obj.get("function") or producer or "")
+    file = str(obj.get("file") or obj.get("source_file") or "")
+    line = str(obj.get("line") or obj.get("source_line") or "")
+    state = obj.get("state") if isinstance(obj.get("state"), dict) else {}
+    hints = tuple(sorted(obj.get("shared_semantic_hints", []) or []))
+    # A semantic cross-state relationship has no single concrete source line;
+    # retain producer+consumer+hints so distinct consumers are not collapsed.
+    if consumer or hints:
+        return ("relationship", producer, consumer, hints)
+    return ("unit", function, file, line, state.get("storage"), state.get("key"))
+
+
+def _v63_seed_location(item):
+    """Normalize source anchors across V5/V6/V6.1 review schemas.
+
+    V5 stores concrete anchors under callback/relevant_locations, while V6
+    review entries normally expose only the function name. V6.1 relationship
+    records use producer/consumer/state rather than a single callback anchor.
+    Never invent a file or line when the upstream graph does not provide one.
+    """
+    if not isinstance(item, dict):
+        return None, None, None
+
+    function = item.get("function") or item.get("producer")
+
+    callback = item.get("callback")
+    if isinstance(callback, dict):
+        function = function or callback.get("name")
+        if callback.get("file") is not None or callback.get("line") is not None:
+            return (
+                function,
+                callback.get("file"),
+                callback.get("line"),
+            )
+
+    locations = item.get("relevant_locations")
+    if isinstance(locations, list):
+        for loc in locations:
+            if not isinstance(loc, dict):
+                continue
+            loc_function = function or loc.get("function") or loc.get("name")
+            if loc.get("file") is not None or loc.get("line") is not None:
+                return (
+                    loc_function,
+                    loc.get("file"),
+                    loc.get("line"),
+                )
+
+    return function, item.get("file"), item.get("line")
+
+
+def _v63_compact_seed_evidence(source, item):
+    """Keep the security evidence needed to start semantic investigation.
+
+    This is deliberately compact: it preserves graph/provenance facts but does
+    not embed source code. The semantic reviewer can load code slices only when
+    a hypothesis needs them.
+    """
+    if not isinstance(item, dict):
+        return {}
+
+    function, file, line = _v63_seed_location(item)
+    evidence = {
+        "source": source,
+        "id": item.get("id"),
+        "function": function,
+        "file": file,
+        "line": line,
+    }
+
+    for key in (
+        "priority_score",
+        "review_effort",
+        "coverage_floor",
+        "must_review",
+        "surface_class",
+        "request_reachable",
+        "confidence",
+        "status",
+    ):
+        if key in item:
+            evidence[key] = item.get(key)
+
+    # V5 entrypoint / callback / flow evidence.
+    for key in ("registration", "entrypoint", "callback", "flow"):
+        value = item.get(key)
+        if isinstance(value, dict):
+            evidence[key] = value
+
+    for key in (
+        "registration_api",
+        "hook",
+        "sources",
+        "controls",
+        "effects",
+        "signals",
+        "risk_reasons",
+        "required_reasoning",
+        "security_meta_hints",
+        "security_name_hints",
+        "kind",
+    ):
+        if key in item:
+            value = item.get(key)
+            if isinstance(value, (list, dict, str, int, float, bool)) or value is None:
+                evidence[key] = value
+
+    # V5 has useful source/sink anchors in relevant_locations. Keep only the
+    # compact security fields; source code remains a drill-down concern.
+    locations = item.get("relevant_locations")
+    if isinstance(locations, list):
+        compact_locations = []
+        for loc in locations:
+            if not isinstance(loc, dict):
+                continue
+            compact = {}
+            for key in ("file", "line", "class", "function", "name", "effects", "controls"):
+                if key in loc:
+                    compact[key] = loc.get(key)
+            if compact:
+                compact_locations.append(compact)
+        if compact_locations:
+            evidence["relevant_locations"] = compact_locations
+
+    # V6.1 concrete state / relationship evidence.
+    state = item.get("state")
+    if isinstance(state, dict):
+        evidence["state"] = {
+            key: state.get(key)
+            for key in ("storage", "key", "scope", "value_type")
+            if key in state
+        }
+
+    consumers = item.get("consumers")
+    if isinstance(consumers, list):
+        compact_consumers = []
+        for consumer in consumers:
+            if not isinstance(consumer, dict):
+                continue
+            compact = {"function": consumer.get("function")}
+            if "security_signal" in consumer:
+                compact["security_signal"] = consumer.get("security_signal")
+            compact_consumers.append(compact)
+        if compact_consumers:
+            evidence["consumers"] = compact_consumers
+            evidence["consumer_count"] = item.get("consumer_count", len(compact_consumers))
+
+    for key in (
+        "producer_security_signal",
+        "security_key_reasons",
+        "required_resolution",
+    ):
+        if key in item:
+            evidence[key] = item.get(key)
+
+    return evidence
+
+
+def _v63_hypothesis_seeds(case):
+    themes = set(case.get("themes", []))
+    seeds = []
+    if "identity" in themes:
+        seeds += [
+            "Could attacker-controlled identity, ownership, role, capability, token, or account state cross a security boundary?",
+            "Could a state transition make a privileged workflow reachable without the expected authorization proof?",
+        ]
+    if "configuration" in themes:
+        seeds += [
+            "Could attacker-controlled configuration alter authentication, authorization, registration, verification, routing, or privilege behavior downstream?",
+        ]
+    if "filesystem" in themes:
+        seeds += [
+            "Could a path, filename, archive, extension, or derived filesystem target cross a trust boundary and produce read/write/upload/delete or code-execution impact?",
+        ]
+    if "injection" in themes:
+        seeds += [
+            "Could an input transformation or custom wrapper preserve attacker control into a parser, query, evaluator, include, or deserializer despite nearby filtering?",
+        ]
+    if "object_authorization" in themes:
+        seeds += [
+            "Could an attacker select another user's/object's identifier and pass a local capability check without proving ownership of that target?",
+        ]
+    if "secrets" in themes:
+        seeds += [
+            "Could a secret, token, credential, or verification artifact become attacker-readable or reusable across users or requests?",
+        ]
+    # Always give the model an explicit invitation to invent a hypothesis
+    # from evidence rather than forcing it into the predefined taxonomy.
+    seeds.append(
+        "What security invariant is assumed by this path, and what non-obvious way could that invariant be violated based on the available source evidence?"
+    )
+    return seeds
+
+
+def build_adaptive_security_investigation_v63(
+    v5_review_index,
+    v6_review_index,
+    v61_cross_state_index,
+    v61_orphan_review_index,
+    v61_fallback_index,
+):
+    """Build adaptive semantic investigation cases without adding a new scan boundary.
+
+    The output is intentionally a plan/evidence index, not a vulnerability verdict.
+    Cases are seeded from already discovered security surfaces. The semantic reviewer
+    may expand a case when evidence creates a new, source-backed relationship.
+    """
+    raw = []
+
+    for source_name, items in (
+        ("v5", v5_review_index),
+        ("v6", v6_review_index),
+        ("v6.1_orphan", v61_orphan_review_index),
+        ("v6.1_fallback", v61_fallback_index),
+    ):
+        for item in items or []:
+            raw.append((source_name, item))
+
+    for item in v61_cross_state_index or []:
+        raw.append(("v6.1_cross_state", item))
+
+    cases = []
+    seen = set()
+
+    for source, item in raw:
+        effects = _v63_effects(item)
+        themes = _v63_themes(item)
+        text = _v63_text(item).lower()
+        # Any security-relevant V6/V6.1 semantic theme is a valid
+        # investigation seed. V6.3 must not suppress a unit merely because
+        # the theme was introduced after the original four-theme set.
+        security_signal = bool(effects & V63_HIGH_IMPACT_EFFECTS) or bool(
+            themes & {
+                "identity",
+                "configuration",
+                "object_authorization",
+                "secrets",
+                "authorization",
+                "ownership",
+                "state_transition",
+                "security_abstraction",
+                "cross_request_state",
+            }
+        )
+
+        # Cross-state records may have no effects; their concrete producer/
+        # consumer relationship is itself the security signal.
+        if source == "v6.1_cross_state":
+            security_signal = True
+            themes.add("configuration")
+
+        if not security_signal:
+            continue
+
+        key = _v63_case_key(item)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        seed_function, seed_file, seed_line = _v63_seed_location(item)
+        seed_evidence = _v63_compact_seed_evidence(source, item)
+
+        priority = 0
+        if effects & V63_HIGH_IMPACT_EFFECTS:
+            priority += 50
+        if _v63_role_signal(item) in {"unauthenticated_or_public", "subscriber", "contributor"}:
+            priority += 35
+        if item.get("review_effort") == "deep":
+            priority += 30
+        if source in {"v6.1_cross_state", "v6.1_orphan", "v6.1_fallback"}:
+            priority += 20
+        if not effects:
+            priority += 10
+
+        # Upstream deep is a floor: V6.3 may promote normal → deep,
+        # but must never downgrade an upstream deep review unit.
+        upstream_effort = item.get("review_effort")
+        review_effort = (
+            "deep"
+            if upstream_effort == "deep" or priority >= 80
+            else "normal"
+        )
+
+        case = {
+            "id": f"WP-V63-CASE-{len(cases)+1:04d}",
+            "seed_source": source,
+            "seed_id": item.get("id"),
+            "seed_function": seed_function,
+            "seed_file": seed_file,
+            "seed_line": seed_line,
+            "seed_evidence": seed_evidence,
+            "themes": sorted(themes),
+            "effects": sorted(effects),
+            "attacker_signal": _v63_role_signal(item),
+            "priority_score": priority,
+            "review_effort": review_effort,
+            "status": "requires_adaptive_semantic_investigation",
+            "hypothesis_seeds": [],
+            "expansion_rules": [
+                "follow only source-backed callers, callees, state readers/writers, inheritance, and framework edges revealed by the current case",
+                "when a new security-relevant relationship is discovered, create a child hypothesis instead of restarting repository-wide discovery",
+                "compare attacker-controlled state with the exact target identity/object before accepting an authorization or ownership bypass",
+                "follow cross-request state when a producer can influence a persisted value consumed by a security-sensitive path",
+                "actively search for counter-evidence before increasing confidence or impact",
+                "stop when the hypothesis is disproved, reaches a concrete accepted impact, or has an explicit unresolved proof gap",
+            ],
+            "proof_requirements": [
+                "attacker reachability",
+                "attacker control over relevant input or state",
+                "missing or bypassed security control",
+                "source-backed security effect",
+                "concrete impact or explicit proof gap",
+            ],
+        }
+        case["hypothesis_seeds"] = _v63_hypothesis_seeds(case)
+        cases.append(case)
+
+    cases.sort(key=lambda x: (-x["priority_score"], x["id"]))
+
+    # Re-number after sorting for deterministic IDs without using source-specific
+    # names or assumptions.
+    for i, case in enumerate(cases, 1):
+        case["id"] = f"WP-V63-CASE-{i:04d}"
+
+    return {
+        "schema_version": "6.3",
+        "purpose": "adaptive source-backed security hypothesis investigation",
+        "policy": {
+            "discovery_is_seeded_by_existing_security_surfaces": True,
+            "ai_may_generate_novel_hypotheses": True,
+            "ai_may_expand_cases_when_new_evidence_appears": True,
+            "no_fixed_hypothesis_budget": True,
+            "no_repository_wide_freeform_scan": True,
+            "counter_evidence_required_before_confirmation": True,
+            "impact_requires_source_backed_proof": True,
+            "unknown_is_not_safe": True,
+            "incomplete_is_not_safe": True,
+        },
+        "investigation_loop": [
+            "seed_from existing V5/V6/V6.1 evidence",
+            "form one or more attack hypotheses",
+            "test each hypothesis against source evidence",
+            "expand only along newly justified security relationships",
+            "actively seek counter-evidence",
+            "prove concrete impact or record the exact remaining proof gap",
+            "do not convert suspicion into a finding without the proof chain",
+        ],
+        "case_count": len(cases),
+        "cases": cases,
     }
 
 
@@ -8342,6 +9002,20 @@ def main():
     semantic_review_plan = build_semantic_review_packs_v62(
         v5_review_index,
         v6_review_index,
+        v61_orphan_review_index,
+        v61_fallback_index,
+    )
+
+    # ------------------------------------------------------------
+    # V6.3 Adaptive security investigation
+    # ------------------------------------------------------------
+
+    print("[*] Building V6.3 adaptive security investigation...")
+
+    adaptive_investigation = build_adaptive_security_investigation_v63(
+        v5_review_index,
+        v6_review_index,
+        v61_cross_state_index,
         v61_orphan_review_index,
         v61_fallback_index,
     )
@@ -8658,6 +9332,66 @@ def main():
         v61_output_dir
         / "coverage-safety-net.json",
         v61_coverage
+    )
+
+    # ------------------------------------------------------------
+    # V6.3 output artifacts
+    # ------------------------------------------------------------
+
+    v63_output_dir = (
+        Path("/opt/codex-security/wpsec-output")
+        / plugin_root.name
+        / "v6.3"
+    )
+
+    v63_output_dir.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    write_json(
+        v63_output_dir / "investigation-plan.json",
+        adaptive_investigation,
+    )
+
+    write_json(
+        v63_output_dir / "hypotheses.json",
+        {
+            "schema_version": "6.3",
+            "purpose": "model-generated hypotheses are expected to be expanded during semantic investigation",
+            "cases": [
+                {
+                    "id": case["id"],
+                    "seed_id": case["seed_id"],
+                    "seed_source": case["seed_source"],
+                    "seed_function": case.get("seed_function"),
+                    "seed_file": case.get("seed_file"),
+                    "seed_line": case.get("seed_line"),
+                    "seed_evidence": case.get("seed_evidence", {}),
+                    "hypothesis_seeds": case["hypothesis_seeds"],
+                    "status": "seed_only",
+                }
+                for case in adaptive_investigation["cases"]
+            ],
+        },
+    )
+
+    write_json(
+        v63_output_dir / "investigation-cases.json",
+        adaptive_investigation["cases"],
+    )
+
+    v63_summary = {
+        "schema_version": "6.3",
+        "plugin": plugin_root.name,
+        "investigation_cases": adaptive_investigation["case_count"],
+        "policy": adaptive_investigation["policy"],
+        "purpose": "adaptive source-backed hypothesis generation and investigation",
+    }
+
+    write_json(
+        v63_output_dir / "summary.json",
+        v63_summary,
     )
 
     print("[*] Generating candidates...")
