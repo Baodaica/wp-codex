@@ -490,41 +490,10 @@ Do not equate security coverage with reading every PHP file.
 Do not launch a generic repository-wide baseline audit merely to achieve
 file coverage.
 
-### Recall-first review policy
+### Review effort
 
-The primary optimization objective is **finding vulnerabilities without
-silent coverage loss**. Token reduction is secondary.
-
-The mapper may prioritize and deduplicate semantic work, but it MUST NOT
-remove a security-relevant path merely because its deterministic score is
-low, its flow is unknown, or its sink family is not yet understood.
-
-Mandatory deep-review floor:
-
-- unauthenticated/public or permission-uncertain paths touching a high-impact
-  effect;
-- subscriber/contributor paths touching a high-impact effect;
-- unknown dataflow that reaches or may reach code execution, dynamic include,
-  deserialization, SQL, file write/upload/read/delete, configuration/option
-  mutation, role/capability/session mutation, or sensitive-secret access;
-- authentication, account recovery, ownership, verification, or privilege
-  transitions that can plausibly produce account takeover or privilege
-  escalation.
-
-`review_effort` is model-work prioritization only. It is NOT severity and
-MUST NOT be used to suppress a unit. `must_review=true` means the unit must
-receive a disposition before the scan can be considered complete.
-
-### Semantic deduplication
-
-V5, V6, and V6.1 may describe the same underlying attack path. To reduce
-repeated model reasoning, the reviewer MAY validate one concrete source-backed
-path once and attach the resulting disposition to all equivalent units.
-
-Deduplication is valid only when the units share the same concrete security
-boundary, attacker-controlled state, target object/state, and security effect.
-If any of those differ, review them separately. Never deduplicate merely
-because function names or sink categories match.
+`review_effort` is model-work prioritization only. It is NOT severity
+and MUST NOT be used to suppress a unit.
 
 For `deep` units:
 
@@ -549,9 +518,7 @@ For `bounded` or flow-`unknown` units:
   relevant locations, and necessary helper edges;
 - never interpret `unknown` as safe;
 - escalate the unit to normal or deep review if a plausible attack path
-  appears;
-- if the unit has a high-impact effect and public/low-privilege or
-  permission-uncertain exposure, apply the mandatory deep-review floor.
+  appears.
 
 ### Per-unit source boundary
 
@@ -666,21 +633,6 @@ Preserve the original Codex Security strengths during semantic review:
 
 Do not reduce semantic validation quality merely because deterministic
 discovery reduced the amount of source that requires model review.
-
-### Recall-first completion check
-
-Before finalizing, explicitly verify that the scan did not lose coverage at
-any deterministic boundary:
-
-- high-impact sinks added by the mapper are represented in a review queue or
-  explicit unresolved/gap queue;
-- public/low-privilege high-impact units were not downgraded below the deep
-  review floor;
-- unknown flow was not treated as safe;
-- duplicate V5/V6/V6.1 descriptions were linked to one validated concrete
-  path rather than silently dropped;
-- dynamic callbacks, dispatch, inheritance, and unresolved dataflow remain
-  explicit gaps when they cannot be resolved statically.
 
 ### Completion
 
@@ -981,6 +933,49 @@ The deterministic mapper provides coverage guidance.
 Codex semantic validation remains the authority for vulnerability
 existence, exploitability, business impact, severity, and confidence.
 
+## WordPress V6.2 Semantic Review Packs
+
+When `v6.1/semantic-review-plan.json` exists, use it as the model-work
+batching layer across V5, V6, and V6.1.
+
+The semantic review plan is **not** a finding list and is **not** a safety
+boundary. It only reduces repeated model context.
+
+### Mandatory invariants
+
+- Every raw V5, V6, V6.1 primary, and V6.1 fallback unit remains represented.
+- Every member requires its own disposition.
+- A pack-level conclusion MUST NOT automatically become a conclusion for
+  every member.
+- Grouping does not prove equivalence, safety, or exploitability.
+- Deep units remain isolated unless the plan explicitly states otherwise.
+- V6.1 fallback units remain separate from primary packs.
+- Unknown flow or unresolved authorization is not safe.
+
+### Review-pack procedure
+
+1. Read `semantic-review-plan.json` first for the compact work plan.
+2. Select packs in descending security importance.
+3. Within each pack, retain the identity of every member ID.
+4. Load only the source slices needed to answer the members' security
+   questions.
+5. Record disposition per member: `confirmed`, `not_vulnerable`, or
+   `unresolved`.
+6. If evidence for one member differs from another, split the reasoning;
+   do not reuse the conclusion merely because they share a pack.
+7. Promote fallback evidence only when the primary review exposes a
+   concrete reason to do so.
+
+### Token-saving rule
+
+It is acceptable to share source context between members when they use the
+same helper, authorization boundary, state key, object identity, or sink.
+Do not load the same source slice repeatedly when one loaded slice can answer
+multiple members.
+
+The optimization target is fewer repeated model-context loads, not fewer
+security units.
+
 ## WordPress V6.1.4 Primary and Fallback Review Queues
 
 When V6.1.4 coverage artifacts are available, treat them as a
@@ -1085,3 +1080,218 @@ The deterministic mapper prioritizes review.
 
 Codex semantic reasoning remains responsible for determining whether a
 real vulnerability exists.
+
+## WordPress V6.3 Adaptive Security Investigation
+
+V6.3 is an additive semantic investigation layer on top of V5, V6, and
+V6.1. It does NOT replace those layers and does NOT redefine their artifacts.
+
+When these artifacts exist:
+
+`wpsec-output/<PLUGIN>/v6.3/summary.json`
+`wpsec-output/<PLUGIN>/v6.3/investigation-plan.json`
+`wpsec-output/<PLUGIN>/v6.3/investigation-cases.json`
+`wpsec-output/<PLUGIN>/v6.3/hypotheses.json`
+
+use V6.3 after the deterministic V5/V6/V6.1 coverage queues have been
+constructed.
+
+### Purpose
+
+V6.3 exists to let semantic reasoning discover non-obvious security
+hypotheses instead of only validating the mapper's predefined vulnerability
+families.
+
+The mapper supplies source-backed seeds. Codex may then:
+
+- formulate new attack hypotheses;
+- challenge assumptions made by the existing taxonomy;
+- connect producers, consumers, helpers, callers, state transitions, and
+  security boundaries;
+- reason across multiple requests when persisted state is involved;
+- investigate ownership, identity, authorization, authentication, and
+  privilege transitions;
+- recognize a security impact that was not explicitly named by V5/V6/V6.1;
+- expand a case when new source evidence justifies the expansion.
+
+The predefined hypothesis seeds are prompts for reasoning, not a fixed list
+of vulnerabilities to search for.
+
+### Adaptive investigation rule
+
+Do NOT impose a fixed number of hypotheses per case.
+
+A case may continue expanding when each expansion is justified by a concrete
+source-backed relationship discovered during the investigation.
+
+The preferred loop is:
+
+1. start from the V6.3 case seed;
+2. formulate one or more plausible security hypotheses;
+3. inspect the smallest source slice needed to test them;
+4. follow newly revealed callers, callees, state readers/writers,
+   inheritance, framework semantics, or downstream consumers;
+5. generate a new hypothesis when the new evidence changes the security
+   model;
+6. actively search for counter-evidence;
+7. either prove a concrete accepted impact, reject the hypothesis, or record
+   an explicit proof gap.
+
+Do not turn adaptive investigation into an independent repository-wide audit.
+
+### Creativity boundary
+
+Codex SHOULD reason beyond the mapper's labels when source evidence supports
+an alternative security invariant.
+
+Examples include:
+
+- an option mutation whose impact is only visible through a later privileged
+  consumer;
+- an apparently harmless user-meta change that bypasses approval or
+  verification in another request;
+- an object identifier that passes a capability check but is not bound to the
+  caller's ownership;
+- a token or state value written by one workflow and trusted by another;
+- a custom wrapper whose security semantics differ from its name;
+- a multi-request transition that produces authentication, authorization,
+  privilege, or code-execution consequences only after state is persisted.
+
+These are examples of reasoning patterns, not mandatory vulnerability
+patterns.
+
+### Evidence ladder
+
+Creative hypothesis generation must be separated from vulnerability
+confirmation.
+
+Use this evidence ladder:
+
+- L0 — suspicion or semantic hypothesis;
+- L1 — concrete source evidence;
+- L2 — attacker reachability;
+- L3 — attacker control over the relevant input or state;
+- L4 — missing, bypassed, or incorrectly scoped security control;
+- L5 — source-backed security effect;
+- L6 — concrete accepted security impact.
+
+A hypothesis may be interesting at L0-L2 but MUST NOT be reported as a
+confirmed vulnerability without the evidence required for the claimed impact.
+
+Do not increase impact merely because a dangerous sink or security-sensitive
+state exists.
+
+### Counter-evidence
+
+For every hypothesis that could become reportable, actively search for:
+
+- capability checks;
+- ownership checks;
+- target-object binding;
+- server-side allowlists;
+- canonicalization or safe transformations;
+- token binding and expiration;
+- state validation at the final consumer;
+- WordPress framework protections;
+- downstream checks that invalidate the proposed chain.
+
+Record meaningful counter-evidence even when the hypothesis remains
+plausible.
+
+### Cross-request reasoning
+
+When a producer writes security-relevant state, determine whether a later
+request can consume that exact state.
+
+Follow:
+
+`request A`
+`-> attacker-controlled mutation`
+`-> concrete persisted state`
+`-> request B`
+`-> security-sensitive consumer`
+`-> security consequence`
+
+Do not infer a chain from matching names alone. Prove the concrete state key,
+field, object, account, or security boundary.
+
+### Case expansion
+
+Expand a V6.3 case only when the current evidence reveals a concrete reason to
+inspect another source region.
+
+Valid expansion triggers include:
+
+- a newly identified security-state writer or reader;
+- an unresolved authorization or ownership decision;
+- a downstream privileged consumer;
+- a token, credential, role, capability, approval, or verification transition;
+- an unexplained caller/callee required by the proposed attack path;
+- a framework or inheritance edge that changes reachability;
+- a new security-sensitive effect discovered while validating the case.
+
+Do NOT expand merely because another file exists or because a function name
+looks interesting.
+
+### Direct primitive versus adaptive chain
+
+If V5 already proves an accepted direct impact, do not create a V6.3 case
+merely to restate it.
+
+Use V6.3 for meaningful uncertainty or chaining, especially where impact
+requires:
+
+- persisted state;
+- a second request;
+- a second security boundary;
+- an identity/ownership transition;
+- downstream configuration consumption;
+- a custom security abstraction;
+- a non-obvious interaction between otherwise low-risk operations.
+
+### Completion and incomplete work
+
+V6.3 does not redefine V5/V6/V6.1 completeness.
+
+A V6.3 case must end in one of these semantic states:
+
+- `REPORTABLE`;
+- `REJECTED_WITH_COUNTER_EVIDENCE`;
+- `DEFERRED_WITH_PROOF_GAP`;
+- `INCOMPLETE`.
+
+`INCOMPLETE` is not equivalent to safe.
+
+If an adaptive investigation reaches a practical reasoning or context limit
+before its proof obligations are resolved, record the exact unresolved
+question rather than suppressing the case.
+
+### Token-efficiency rule
+
+Optimize for useful security reasoning, not a hard token count.
+
+Prefer:
+
+- one adaptive investigation context per concrete case;
+- compact mapper evidence as the initial context;
+- source slices instead of whole-file loading;
+- expansion only when evidence justifies it;
+- reuse of already inspected source evidence;
+- no duplicate review of the same concrete security boundary.
+
+Do NOT cap investigation depth merely to reduce token consumption when the
+case remains materially unresolved. The correct optimization target is
+useful security findings per unit of model work.
+
+### V6.3 coverage rule
+
+V6.3 is an additional hypothesis-generation and investigation layer, not a
+new suppression boundary.
+
+The absence of a V6.3 case does NOT prove that a plugin is safe.
+
+V5/V6/V6.1 remain responsible for deterministic security-surface coverage.
+V6.3 increases semantic discovery depth over those surfaces.
+
+The final security conclusion remains the responsibility of source-backed
+semantic validation.
