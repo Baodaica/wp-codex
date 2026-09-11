@@ -639,6 +639,52 @@ def index_functions(plugin_root):
     return index
 
 
+def index_rest_anonymous_callbacks(
+    function_index,
+    rest_entrypoints,
+):
+    """
+    Add only anonymous REST callbacks to the shared function index.
+    This keeps unrelated anonymous closures out of the global index.
+    """
+    if not isinstance(function_index, dict):
+        return function_index
+
+    for reg in rest_entrypoints or []:
+        callback = reg.get("callback") or {}
+
+        if callback.get("type") != "anonymous":
+            continue
+
+        name = callback.get("name")
+        body = callback.get("body")
+
+        if not name or not isinstance(body, str) or not body.strip():
+            continue
+
+        key = name.lower()
+
+        item = {
+            "name": name,
+            "class": None,
+            "file": callback.get("registration_file"),
+            "line": callback.get("registration_line"),
+            "body": body,
+        }
+
+        existing = function_index.setdefault(key, [])
+
+        if not any(
+            x.get("name") == item["name"]
+            and x.get("file") == item["file"]
+            and x.get("line") == item["line"]
+            for x in existing
+        ):
+            existing.append(item)
+
+    return function_index
+
+
 # ============================================================
 # WORDPRESS ENTRYPOINT REGISTRATION
 # ============================================================
@@ -844,33 +890,71 @@ def extract_balanced_call(text, start):
     return None
 
 
+
+def extract_rest_anonymous_callback(call_text):
+    """
+    Extract the body of an anonymous PHP closure used as a REST
+    callback.
+
+    This is intentionally generic: it does not assume anything
+    about the plugin, route name, service class, or callback
+    implementation.
+    """
+    m = re.search(
+        r"""
+        ['"]callback['"]
+        \s*=>
+        \s*
+        function\b
+        [^{]*
+        \{
+        """,
+        call_text,
+        re.X | re.I
+    )
+
+    if not m:
+        return None
+
+    brace = call_text.find("{", m.start())
+
+    if brace == -1:
+        return None
+
+    close = find_matching_brace(
+        call_text,
+        brace
+    )
+
+    if close is None:
+        return None
+
+    return call_text[m.start():close + 1]
+
+
 def parse_rest_callback(call_text):
     """
     Parse common WordPress REST callback representations.
 
     Supported:
       'callback' => 'function_name'
-
       'callback' => [$this, 'method']
       'callback' => array($this, 'method')
-
       'callback' => ['ClassName', 'method']
       'callback' => array('ClassName', 'method')
-
       'callback' => [ClassName::class, 'method']
       'callback' => array(ClassName::class, 'method')
-
       'callback' => [self::class, 'method']
       'callback' => array(self::class, 'method')
-
       'callback' => [static::class, 'method']
       'callback' => array(static::class, 'method')
+
+    Also preserves unresolved/anonymous callbacks instead of
+    dropping the REST route from the security graph.
     """
 
     # --------------------------------------------------------
     # Plain function callback
-    #
-    # 'callback' => 'function_name'
     # --------------------------------------------------------
 
     m = re.search(
@@ -895,9 +979,6 @@ def parse_rest_callback(call_text):
 
     # --------------------------------------------------------
     # Instance method
-    #
-    # [$this, 'method']
-    # array($this, 'method')
     # --------------------------------------------------------
 
     m = re.search(
@@ -928,9 +1009,6 @@ def parse_rest_callback(call_text):
 
     # --------------------------------------------------------
     # String class callback
-    #
-    # ['ClassName', 'method']
-    # array('ClassName', 'method')
     # --------------------------------------------------------
 
     m = re.search(
@@ -964,11 +1042,6 @@ def parse_rest_callback(call_text):
 
     # --------------------------------------------------------
     # ::class callback
-    #
-    # [ClassName::class, 'method']
-    # array(ClassName::class, 'method')
-    #
-    # Also supports self::class / static::class / parent::class
     # --------------------------------------------------------
 
     m = re.search(
@@ -1017,7 +1090,148 @@ def parse_rest_callback(call_text):
             "function": m.group(2),
         }
 
+    # --------------------------------------------------------
+    # Anonymous / closure callback
+    #
+    # Example:
+    # 'callback' => function () use (...) { ... }
+    # --------------------------------------------------------
+
+    if re.search(
+        r"""
+        ['"]callback['"]
+        \s*=>
+        \s*
+        function\b
+        """,
+        call_text,
+        re.X | re.I
+    ):
+        anonymous_body = extract_rest_anonymous_callback(
+            call_text
+        )
+
+        return {
+            "type": "anonymous",
+            "function": None,
+            "class": None,
+            "body": anonymous_body,
+        }
+
+    # --------------------------------------------------------
+    # Dynamic / unresolved callback
+    #
+    # Preserve the REST route so later V5/V6/V6.1 analysis
+    # can reason about the unresolved callback rather than
+    # treating the route as nonexistent.
+    # --------------------------------------------------------
+
+    if re.search(
+        r"""['"]callback['"]\s*=>""",
+        call_text,
+        re.X | re.I
+    ):
+        return {
+            "type": "dynamic",
+            "function": None,
+            "class": None,
+        }
+
     return None
+
+
+def rest_access(call_text):
+    if re.search(
+        r"""
+        ['"]permission_callback['"]
+        \s*=>
+        \s*
+        ['"]__return_true['"]
+        """,
+        call_text,
+        re.X | re.I
+    ):
+        return "unauthenticated"
+
+    if "permission_callback" not in call_text:
+        return "unknown_permission_callback"
+
+    return "permission_callback_requires_analysis"
+
+
+def collect_rest_entrypoints(plugin_root):
+    result = []
+
+    php_files = sorted(
+        p for p in plugin_root.rglob("*.php")
+        if p.is_file()
+        and not should_skip(p, plugin_root)
+    )
+
+    for path in php_files:
+        text = read_text(path)
+
+        for match in REST_START_RE.finditer(text):
+            call = extract_balanced_call(
+                text,
+                match.start()
+            )
+
+            if not call:
+                continue
+
+            callback = parse_rest_callback(call)
+
+            # Do not discard REST registrations merely because
+            # callback resolution is incomplete. Dynamic and
+            # anonymous callbacks remain security-relevant
+            # entrypoints and must flow into later analysis.
+            if callback is None:
+                callback = {
+                    "type": "unresolved",
+                    "function": None,
+                    "class": None,
+                }
+
+            # Preserve registration context on anonymous callbacks
+            # so the resolver can construct a synthetic definition
+            # without inventing a plugin-specific function name.
+            if callback.get("type") == "anonymous":
+                callback["registration_file"] = str(
+                    path.relative_to(plugin_root)
+                )
+                callback["registration_line"] = line_number(
+                    text,
+                    match.start()
+                )
+                callback["name"] = (
+                    "__rest_anonymous_callback_"
+                    f"{callback['registration_line'] or 'unknown'}"
+                )
+                callback["name"] = (
+                    "__rest_anonymous_callback_"
+                    f"{callback["registration_line"] or "unknown"}"
+                )
+
+            result.append({
+                "type": "rest",
+                "hook": "register_rest_route",
+                "minimum_access": rest_access(call),
+                "callback": callback,
+                "registration": {
+                    "file": str(
+                        path.relative_to(plugin_root)
+                    ),
+                    "line": line_number(
+                        text,
+                        match.start()
+                    ),
+                    "code": call[:3000],
+                }
+            })
+
+    return result
+
 
 
 def rest_access(call_text):
@@ -1064,8 +1278,25 @@ def collect_rest_entrypoints(plugin_root):
                 call
             )
 
-            if not callback:
-                continue
+            if callback is None:
+                callback = {
+                    "type": "unresolved",
+                    "function": None,
+                    "class": None,
+                }
+
+            if callback.get("type") == "anonymous":
+                callback["registration_file"] = str(
+                    path.relative_to(plugin_root)
+                )
+                callback["registration_line"] = line_number(
+                    text,
+                    match.start()
+                )
+                callback["name"] = (
+                    "__rest_anonymous_callback_"
+                    f"{callback['registration_line'] or 'unknown'}"
+                )
 
             result.append({
                 "type": "rest",
@@ -1251,6 +1482,21 @@ def parse_generic_callback_expr(expr):
     """
 
     expr = expr.strip()
+
+    # Anonymous closure: function (...) { ... }
+    if re.match(r"^function\b", expr, re.I):
+        brace = expr.find("{")
+
+        if brace != -1:
+            close = find_matching_brace(expr, brace)
+
+            if close is not None:
+                return {
+                    "type": "anonymous",
+                    "function": None,
+                    "class": None,
+                    "body": expr[brace + 1:close],
+                }
 
     # 'function_name'
     m = re.fullmatch(
@@ -4158,6 +4404,42 @@ def resolve_generic_registration_callback(
     if not callback:
         return []
 
+    # Anonymous callbacks are valid request-surface definitions.
+    # Reuse the same synthetic-definition representation used by
+    # resolve_callback() so generic V5 review-unit generation can
+    # inspect the closure body without inventing a named function.
+    if callback.get("type") == "anonymous":
+        body = callback.get("body")
+
+        if not isinstance(body, str) or not body.strip():
+            return []
+
+        registration_meta = registration.get(
+            "registration",
+            {}
+        )
+
+        registration_file = (
+            callback.get("registration_file")
+            or registration_meta.get("file")
+        )
+
+        registration_line = (
+            callback.get("registration_line")
+            or registration_meta.get("line")
+        )
+
+        return [{
+            "name": (
+                "__rest_anonymous_callback_"
+                f"{registration_line or 'unknown'}"
+            ),
+            "class": None,
+            "file": registration_file,
+            "line": registration_line,
+            "body": body,
+        }]
+
     name = callback.get("function")
 
     if not name:
@@ -4186,6 +4468,124 @@ def resolve_generic_registration_callback(
     return definitions
 
 
+def build_rest_review_units_v5(
+    rest_entrypoints,
+    function_index,
+):
+    """
+    Build V5 review units directly from register_rest_route()
+    entrypoints.
+
+    REST routes are collected separately from generic hook
+    registrations, so they must be explicitly promoted into the
+    V5 review queue.
+    """
+    units = []
+    unit_id = 1
+
+    for reg in rest_entrypoints:
+        definitions = resolve_generic_registration_callback(
+            reg,
+            function_index
+        )
+
+        if not definitions:
+            continue
+
+        for definition in definitions:
+            profile = profile_callback_security_v5(
+                definition,
+                function_index,
+                max_depth=3
+            )
+
+            if not profile["security_relevant"]:
+                continue
+
+            minimum_access = reg.get(
+                "minimum_access"
+            )
+
+            units.append({
+                "id":
+                    f"WP-V5-REST-{unit_id:04d}",
+
+                "surface_class": (
+                    "known_public"
+                    if minimum_access
+                    == "unauthenticated"
+                    else "unknown"
+                ),
+
+                "registration_api":
+                    "register_rest_route",
+
+                "hook":
+                    "register_rest_route",
+
+                "registration":
+                    reg.get(
+                        "registration",
+                        {}
+                    ),
+
+                "minimum_access":
+                    minimum_access,
+
+                "callback": {
+                    "file":
+                        definition.get("file"),
+                    "line":
+                        definition.get("line"),
+                    "class":
+                        definition.get("class"),
+                    "name":
+                        definition.get("name"),
+                },
+
+                "sources":
+                    profile["sources"],
+
+                "controls":
+                    profile["controls"],
+
+                "effects":
+                    profile["effects"],
+
+                "signals": {
+                    "request_source":
+                        profile["has_request_source"],
+                    "object_lookup":
+                        profile["has_object_lookup"],
+                },
+
+                "graph_summary": {
+                    "reachable_functions":
+                        profile[
+                            "reachable_function_count"
+                        ],
+                    "call_edges":
+                        profile[
+                            "call_edge_count"
+                        ],
+                },
+
+                "relevant_functions":
+                    profile["relevant_functions"],
+
+                "call_paths":
+                    profile["call_paths"],
+
+                "flow_confidence":
+                    "reachability_only",
+            })
+
+            unit_id += 1
+
+    return units
+
+
+
 def build_generic_review_units_v5(
     registrations,
     function_index
@@ -4203,6 +4603,7 @@ def build_generic_review_units_v5(
         if reg.get("surface_class") not in {
             "known_public",
             "conditional",
+            "unknown",
         }:
             continue
 
@@ -4315,7 +4716,62 @@ def build_generic_review_units_v5(
 def resolve_callback(entrypoint, function_index):
     callback = entrypoint["callback"]
 
-    name = callback["function"].lower()
+    callback_type = callback.get("type")
+
+    # --------------------------------------------------------
+    # Anonymous REST closure
+    #
+    # Treat the closure as a local synthetic definition so the
+    # existing V5 source/control/sink and bounded call-graph
+    # analysis can inspect its body.
+    #
+    # This is generic and does not depend on route names,
+    # plugin names, service classes, or framework conventions.
+    # --------------------------------------------------------
+
+    if callback_type == "anonymous":
+        body = callback.get("body")
+
+        if not isinstance(body, str) or not body.strip():
+            return []
+
+        registration_file = callback.get(
+            "registration_file"
+        )
+
+        registration_line = callback.get(
+            "registration_line"
+        )
+
+        synthetic_name = (
+            "__rest_anonymous_callback_"
+            f"{registration_line or 'unknown'}"
+        )
+
+        return [{
+            "name": synthetic_name,
+            "class": None,
+            "file": registration_file,
+            "line": registration_line,
+            "body": body,
+        }]
+
+    # --------------------------------------------------------
+    # Dynamic / unresolved callback
+    #
+    # Do not invent a target. The REST registration remains
+    # visible to the unresolved-entrypoint coverage path.
+    # --------------------------------------------------------
+
+    callback_function = callback.get("function")
+
+    if not isinstance(callback_function, str):
+        return []
+
+    if not callback_function.strip():
+        return []
+
+    name = callback_function.lower()
 
     definitions = function_index.get(
         name,
@@ -6460,6 +6916,36 @@ def build_security_state_graph_v6(
                 name,
                 []
             ).append(reg)
+
+    # REST registrations may use anonymous callbacks and therefore
+    # are not present in the generic registration resolver. Preserve
+    # their provenance for V6 request-reachability analysis.
+    for reg in review_units or []:
+        if reg.get("registration_api") != "register_rest_route":
+            continue
+
+        cb = reg.get("callback") or {}
+        name = cb.get("name")
+
+        if not name:
+            continue
+
+        registration_by_callback.setdefault(
+            name,
+            []
+        ).append({
+            "type": "rest",
+            "hook": "register_rest_route",
+            "minimum_access":
+                reg.get("minimum_access"),
+            "callback": {
+                "name": name,
+                "class": cb.get("class"),
+                "function": name,
+            },
+            "registration":
+                reg.get("registration", {}),
+        })
 
     counter = 0
 
@@ -8881,6 +9367,11 @@ def main():
         plugin_root
     )
 
+    function_index = index_rest_anonymous_callbacks(
+        function_index,
+        rest_eps,
+    )
+
     entrypoints = (
         action_eps
         +
@@ -8902,11 +9393,23 @@ def main():
         )
     )
 
-    v5_review_units = (
+    generic_v5_review_units = (
         build_generic_review_units_v5(
             resolved_registrations,
             function_index
         )
+    )
+
+    rest_v5_review_units = (
+        build_rest_review_units_v5(
+            rest_eps,
+            function_index
+        )
+    )
+
+    v5_review_units = (
+        generic_v5_review_units
+        + rest_v5_review_units
     )
 
     v5_review_units = (
